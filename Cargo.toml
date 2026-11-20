@@ -1,6 +1,6 @@
 [package]
 name = "lazydon"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A Vim-inspired Mastodon terminal client"
 license = "MIT"

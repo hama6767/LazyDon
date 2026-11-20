@@ -23,6 +23,7 @@ pub enum Mode {
     Help,
     Detail,
     Profile,
+    Thread,
     Settings,
     AccountManage,
     AccountAdd,
@@ -47,6 +48,17 @@ pub struct Attachment {
     pub url: String,
     pub description: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplyDraft {
+    pub id: String,
+    pub author: String,
+    pub acct: String,
+    pub visibility: Option<String>,
+    original_visibility: String,
+    recipients: Vec<(String, String)>,
+    mention_prefix: String,
+    generation: u64,
+}
 #[derive(Clone)]
 pub struct ViewItem {
     pub id: String,
@@ -55,6 +67,8 @@ pub struct ViewItem {
     pub acct: String,
     pub account_id: String,
     pub reply_to_id: Option<String>,
+    pub visibility: String,
+    pub mentions: Vec<api::Mention>,
     pub content: String,
     pub timestamp: String,
     pub context: String,
@@ -75,9 +89,85 @@ pub struct Profile {
     pub loading_posts: bool,
     pub has_more: bool,
     pub scroll: u16,
+    pub selected: usize,
     id: String,
     next_id: Option<String>,
     generation: u64,
+}
+pub struct ThreadEntry {
+    pub item: ViewItem,
+    pub prefix: String,
+}
+pub struct ThreadState {
+    pub entries: Vec<ThreadEntry>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub truncated: bool,
+    pending_selection: Option<String>,
+    generation: u64,
+}
+
+// Use the server-provided parent IDs rather than assuming that descendants are
+// in tree order. Duplicate IDs and cycles are ignored, and rendering stays bounded.
+fn thread_entries(root: &str, statuses: Vec<Status>) -> Vec<ThreadEntry> {
+    const LIMIT: usize = 500;
+    const MAX_DEPTH: usize = 8;
+    let mut seen = HashSet::new();
+    let statuses: Vec<Status> = statuses
+        .into_iter()
+        .filter(|s| !s.id.is_empty() && s.id != root && seen.insert(s.id.clone()))
+        .take(LIMIT)
+        .collect();
+    let ids: HashSet<&str> = statuses.iter().map(|s| s.id.as_str()).collect();
+    let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut roots = Vec::new();
+    for (index, status) in statuses.iter().enumerate() {
+        match status.in_reply_to_id.as_deref() {
+            Some(parent) if parent != status.id && ids.contains(parent) => {
+                children.entry(parent).or_default().push(index)
+            }
+            _ => roots.push(index),
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut entries = Vec::new();
+    let mut walk = |start: usize, last_root: bool| {
+        let mut stack = vec![(start, Vec::<bool>::new(), last_root)];
+        while let Some((index, ancestors, last)) = stack.pop() {
+            if !visited.insert(index) {
+                continue;
+            }
+            let mut prefix = String::new();
+            for &has_next in &ancestors {
+                prefix.push_str(if has_next { "│  " } else { "   " });
+            }
+            prefix.push_str(if last { "└─ " } else { "├─ " });
+            let status = &statuses[index];
+            entries.push(ThreadEntry {
+                item: view(status.clone(), String::new()),
+                prefix,
+            });
+            if let Some(kids) = children.get(status.id.as_str()) {
+                for (position, child) in kids.iter().enumerate().rev() {
+                    let mut next = ancestors.clone();
+                    if next.len() < MAX_DEPTH {
+                        next.push(!last);
+                    }
+                    stack.push((*child, next, position + 1 == kids.len()));
+                }
+            }
+        }
+    };
+    let root_count = roots.len();
+    for (position, index) in roots.into_iter().enumerate() {
+        walk(index, position + 1 == root_count);
+    }
+    // Orphans forming a cycle have no root; show each component once.
+    for index in 0..statuses.len() {
+        walk(index, true);
+    }
+    entries
 }
 pub struct App {
     pub tabs: Vec<Tab>,
@@ -86,13 +176,23 @@ pub struct App {
     pub mode: Mode,
     pub input: String,
     pub input_cursor: usize,
+    pub reply_draft: Option<ReplyDraft>,
+    reply_generation: u64,
+    compose_return: Mode,
+    discard_armed: bool,
     pub settings: settings::Settings,
     pub settings_index: usize,
     pub settings_message: String,
     pub font_candidate: Option<u8>,
     pub detail_index: usize,
     pub detail_scroll: u16,
+    detail_item: Option<ViewItem>,
+    detail_history: Vec<(Option<ViewItem>, Mode, usize, u16)>,
     pub profile: Option<Profile>,
+    profile_history: Vec<Profile>,
+    pub threads: HashMap<String, ThreadState>,
+    pub thread_stack: Vec<String>,
+    thread_generation: u64,
     profile_generation: u64,
     pub reply_targets: HashMap<String, Result<Account, String>>,
     reply_requests: HashSet<String>,
@@ -137,9 +237,11 @@ enum Message {
     Stream(StreamMessage),
     Clipboard(Result<Vec<u8>, String>),
     Posted(Result<(), String>),
+    ReplyIdentity(u64, Result<Account, String>),
     Action(String, bool, bool, Result<Status, String>),
     ReplyTarget(String, Result<Account, String>),
     Follow(String, Result<api::Relationship, String>),
+    ThreadLoaded(String, u64, Result<Vec<Status>, String>),
     ProfileAccount(u64, Result<Account, String>),
     ProfilePosts(u64, Result<Vec<Status>, String>),
     AuthRegistered(u64, Result<api::Authorization, String>),
@@ -246,6 +348,8 @@ fn view(status: Status, context: String) -> ViewItem {
         key,
         account_id: status.account.id.clone(),
         reply_to_id: status.in_reply_to_id.clone().filter(|id| !id.is_empty()),
+        visibility: status.visibility.clone(),
+        mentions: status.mentions.clone(),
         author: if status.account.display_name.is_empty() {
             acct.clone()
         } else {
@@ -307,6 +411,8 @@ fn notification(n: Notification) -> ViewItem {
             acct: n.account.acct,
             account_id: n.account.id,
             reply_to_id: None,
+            visibility: String::new(),
+            mentions: vec![],
             content: label,
             timestamp: n.created_at,
             context: "notification".into(),
@@ -367,6 +473,8 @@ fn apply_event(tab: &mut Tab, event: &StreamEvent) {
                 if existing.id == updated.id && !updated.id.is_empty() {
                     existing.author = updated.author.clone();
                     existing.acct = updated.acct.clone();
+                    existing.visibility = updated.visibility.clone();
+                    existing.mentions = updated.mentions.clone();
                     existing.content = updated.content.clone();
                     existing.media = updated.media.clone();
                     existing.attachments = updated.attachments.clone();
@@ -395,6 +503,24 @@ fn event_applies(kind: Kind, stream: StreamKind, event: &StreamEvent) -> bool {
         StreamEvent::RefreshNotifications => false,
     }
 }
+// Unknown visibility is treated as direct, never as a public post.
+fn reply_visibility<'a>(original: &'a str, preferred: Option<&'a str>) -> &'a str {
+    fn rank(value: &str) -> Option<u8> {
+        match value {
+            "direct" => Some(0),
+            "private" => Some(1),
+            "unlisted" => Some(2),
+            "public" => Some(3),
+            _ => None,
+        }
+    }
+    let preferred = preferred.unwrap_or("");
+    match (rank(original), rank(preferred)) {
+        (Some(a), Some(b)) if a <= b => original,
+        (Some(_), Some(_)) => preferred,
+        _ => "direct",
+    }
+}
 impl App {
     fn new(config: Config, account: String) -> (Self, mpsc::Receiver<Message>) {
         let (tx, rx) = mpsc::channel();
@@ -417,13 +543,23 @@ impl App {
                 mode: Mode::Normal,
                 input: String::new(),
                 input_cursor: 0,
+                reply_draft: None,
+                reply_generation: 0,
+                compose_return: Mode::Normal,
+                discard_armed: false,
                 settings: preferences,
                 settings_index: 0,
                 settings_message: String::new(),
                 font_candidate,
                 detail_index: 0,
                 detail_scroll: 0,
+                detail_item: None,
+                detail_history: Vec::new(),
                 profile: None,
+                profile_history: Vec::new(),
+                threads: HashMap::new(),
+                thread_stack: Vec::new(),
+                thread_generation: 0,
                 profile_generation: 0,
                 reply_targets: HashMap::new(),
                 reply_requests: HashSet::new(),
@@ -461,6 +597,56 @@ impl App {
     }
     pub fn attachment_count(&self) -> usize {
         self.attachments.len()
+    }
+    fn resume_draft(&mut self) {
+        self.compose_return = self.mode;
+        self.mode = Mode::Compose;
+        self.status = format!("{} image(s) attached.", self.attachments.len());
+    }
+    fn start_reply(&mut self, item: ViewItem) {
+        if item.id.is_empty() || item.acct.is_empty() {
+            self.status = "This notification has no post to reply to.".into();
+            return;
+        }
+        if self
+            .reply_draft
+            .as_ref()
+            .is_some_and(|draft| draft.id == item.id)
+        {
+            self.compose_return = self.mode;
+            self.mode = Mode::Compose;
+            return;
+        }
+        if !self.input.is_empty() || !self.attachments.is_empty() {
+            self.status =
+                "A different draft is retained. Press c to finish it before replying.".into();
+            return;
+        }
+        self.reply_generation = self.reply_generation.wrapping_add(1);
+        let generation = self.reply_generation;
+        let mut recipients = vec![(item.account_id.clone(), item.acct.clone())];
+        recipients.extend(item.mentions.iter().map(|m| (m.id.clone(), m.acct.clone())));
+        self.reply_draft = Some(ReplyDraft {
+            id: item.id,
+            author: item.author,
+            acct: item.acct,
+            visibility: None,
+            original_visibility: item.visibility,
+            recipients,
+            mention_prefix: String::new(),
+            generation,
+        });
+        self.compose_return = self.mode;
+        self.mode = Mode::Compose;
+        self.status = "Checking reply visibility and recipients…".into();
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = Mastodon::new(config)
+                .and_then(|client| client.verify_credentials())
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Message::ReplyIdentity(generation, result));
+        });
     }
     fn refresh(&mut self, kind: Kind) {
         self.request_id += 1;
@@ -530,23 +716,46 @@ impl App {
         }
     }
     fn update_preview(&mut self) {
-        let url = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.items.get(t.selected))
-            .and_then(|i| i.media.first())
-            .cloned();
+        let url = self.selected().and_then(|i| i.media.first()).cloned();
         if url == self.preview_url {
             return;
         }
         self.preview_url = url.clone();
         self.native_preview = url.map(|url| media::NativePreview::start(self.picker, url));
     }
-    fn selected(&self) -> Option<&ViewItem> {
-        self.tabs
-            .get(self.active)?
-            .items
-            .get(self.tabs.get(self.active)?.selected)
+    pub(crate) fn selected(&self) -> Option<&ViewItem> {
+        self.detail_item.as_ref().or_else(|| {
+            self.tabs
+                .get(self.active)
+                .and_then(|tab| tab.items.get(tab.selected))
+        })
+    }
+    pub(crate) fn open_detail_item(&mut self, item: ViewItem, return_mode: Mode) {
+        self.detail_history.push((
+            self.detail_item.take(),
+            return_mode,
+            self.detail_index,
+            self.detail_scroll,
+        ));
+        self.detail_item = Some(item);
+        self.detail_index = 0;
+        self.detail_scroll = 0;
+        self.mode = Mode::Detail;
+        self.update_preview();
+        self.load_reply_target();
+        self.load_thread(false);
+    }
+    fn close_detail(&mut self) {
+        if let Some((item, mode, index, scroll)) = self.detail_history.pop() {
+            self.detail_item = item;
+            self.detail_index = index;
+            self.detail_scroll = scroll;
+            self.mode = mode;
+        } else {
+            self.detail_item = None;
+            self.mode = Mode::Normal;
+        }
+        self.update_preview();
     }
     fn action(&mut self, boost: bool) {
         let Some(item) = self.selected() else {
@@ -576,6 +785,66 @@ impl App {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Message::Action(id, boost, action == "favourite", result));
         });
+    }
+    fn load_thread(&mut self, retry: bool) {
+        let Some(id) = self
+            .selected()
+            .map(|item| item.id.clone())
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        if self.threads.contains_key(&id) && !retry {
+            return;
+        }
+        self.thread_generation = self.thread_generation.wrapping_add(1);
+        let generation = self.thread_generation;
+        let pending_selection = self.threads.get(&id).and_then(|state| {
+            state
+                .entries
+                .get(state.selected)
+                .map(|entry| entry.item.id.clone())
+                .or_else(|| state.pending_selection.clone())
+        });
+        self.threads.insert(
+            id.clone(),
+            ThreadState {
+                entries: Vec::new(),
+                selected: 0,
+                loading: true,
+                error: None,
+                truncated: false,
+                pending_selection,
+                generation,
+            },
+        );
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = Mastodon::new(config)
+                .and_then(|c| c.status_context(&id))
+                .map(|context| context.descendants)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Message::ThreadLoaded(id, generation, result));
+        });
+    }
+    fn refresh_after_reply(&mut self, target_id: &str) {
+        let is_current = self.selected().is_some_and(|item| item.id == target_id);
+        // In thread mode selected() is the parent detail. Invalidate the
+        // target's cached context and refresh the visible thread as well.
+        if !is_current {
+            self.threads.remove(target_id);
+        }
+        if is_current || self.mode == Mode::Thread {
+            self.load_thread(true);
+        }
+    }
+    fn selected_thread_item(&self) -> Option<ViewItem> {
+        let state = self.threads.get(self.thread_stack.last()?)?;
+        state
+            .entries
+            .get(state.selected)
+            .map(|entry| entry.item.clone())
     }
     fn load_reply_target(&mut self) {
         let Some(id) = self.selected().and_then(|item| item.reply_to_id.clone()) else {
@@ -624,6 +893,9 @@ impl App {
             self.status = "Select a loaded account to view its profile.".into();
             return;
         };
+        if let Some(profile) = self.profile.take() {
+            self.profile_history.push(profile);
+        }
         self.profile_generation = self.profile_generation.wrapping_add(1);
         let generation = self.profile_generation;
         self.profile = Some(Profile {
@@ -634,6 +906,7 @@ impl App {
             loading_posts: false,
             has_more: true,
             scroll: 0,
+            selected: 0,
             id: id.clone(),
             next_id: None,
             generation,
@@ -736,15 +1009,66 @@ impl App {
                 self.busy = false;
                 match result {
                     Ok(()) => {
+                        let reply_id = self.reply_draft.as_ref().map(|d| d.id.clone());
                         self.input.clear();
                         self.input_cursor = 0;
+                        self.reply_draft = None;
                         self.attachments.clear();
-                        self.mode = Mode::Normal;
+                        self.mode = self.compose_return;
+                        if let Some(id) = reply_id {
+                            self.refresh_after_reply(&id);
+                        }
                         self.refresh(Kind::Home);
                         self.status = "Posted.".into();
                     }
                     Err(e) => self.status = format!("Post failed (draft retained): {e}"),
                 }
+            }
+            Message::ReplyIdentity(generation, result) => {
+                let Some(draft) = self
+                    .reply_draft
+                    .as_mut()
+                    .filter(|d| d.generation == generation)
+                else {
+                    return;
+                };
+                let identity = result.as_ref().ok();
+                let preferred = identity
+                    .and_then(|a| a.source.as_ref())
+                    .map(|s| s.privacy.as_str());
+                draft.visibility =
+                    Some(reply_visibility(&draft.original_visibility, preferred).into());
+                let own_id = identity.map(|a| a.id.as_str()).unwrap_or("");
+                let own_acct = identity.map(|a| a.acct.as_str()).unwrap_or("");
+                let mut seen = HashSet::new();
+                let mentions = draft
+                    .recipients
+                    .iter()
+                    .filter_map(|(id, acct)| {
+                        let acct = acct.trim_start_matches('@');
+                        if acct.is_empty()
+                            || !acct
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || "_-.@".contains(c))
+                            || (!own_id.is_empty() && id == own_id)
+                            || (!own_acct.is_empty() && acct.eq_ignore_ascii_case(own_acct))
+                            || !seen.insert(acct.to_ascii_lowercase())
+                        {
+                            return None;
+                        }
+                        Some(format!("@{acct}"))
+                    })
+                    .collect::<Vec<_>>();
+                if !mentions.is_empty() {
+                    draft.mention_prefix = format!("{} ", mentions.join(" "));
+                    self.input.insert_str(0, &draft.mention_prefix);
+                    self.input_cursor += draft.mention_prefix.len();
+                }
+                self.status = if result.is_err() || preferred.is_none() {
+                    "Could not read default visibility; reply is direct for safety.".into()
+                } else {
+                    "Reply ready. Review recipients and visibility before sending.".into()
+                };
             }
             Message::AuthRegistered(attempt, result)
                 if attempt == self.auth_attempt && self.mode == Mode::AccountAdd =>
@@ -801,11 +1125,42 @@ impl App {
                 self.reply_requests.remove(&id);
                 self.reply_targets.insert(id, result);
             }
+            Message::ThreadLoaded(id, generation, result) => {
+                if let Some(state) = self
+                    .threads
+                    .get_mut(&id)
+                    .filter(|s| s.generation == generation)
+                {
+                    state.loading = false;
+                    match result {
+                        Ok(statuses) => {
+                            state.truncated = statuses.len() > 500;
+                            state.entries = thread_entries(&id, statuses);
+                            state.selected = state
+                                .pending_selection
+                                .take()
+                                .and_then(|selected| {
+                                    state
+                                        .entries
+                                        .iter()
+                                        .position(|entry| entry.item.id == selected)
+                                })
+                                .unwrap_or(0);
+                        }
+                        Err(error) => state.error = Some(error),
+                    }
+                }
+            }
             Message::ProfileAccount(generation, result) => {
                 if let Some(profile) = self
                     .profile
                     .as_mut()
-                    .filter(|p| p.generation == generation && self.mode == Mode::Profile)
+                    .filter(|p| p.generation == generation)
+                    .or_else(|| {
+                        self.profile_history
+                            .iter_mut()
+                            .find(|p| p.generation == generation)
+                    })
                 {
                     match result {
                         Ok(account) => profile.account = Some(account),
@@ -817,7 +1172,12 @@ impl App {
                 if let Some(profile) = self
                     .profile
                     .as_mut()
-                    .filter(|p| p.generation == generation && self.mode == Mode::Profile)
+                    .filter(|p| p.generation == generation)
+                    .or_else(|| {
+                        self.profile_history
+                            .iter_mut()
+                            .find(|p| p.generation == generation)
+                    })
                 {
                     profile.loading_posts = false;
                     match result {
@@ -975,17 +1335,18 @@ impl App {
                     self.font_candidate = self.settings.font_size;
                 }
                 KeyCode::Enter => {
-                    if self.selected().is_some() {
-                        self.detail_index = 0;
-                        self.detail_scroll = 0;
-                        self.mode = Mode::Detail;
-                        self.load_reply_target();
+                    if let Some(item) = self.selected().cloned() {
+                        self.open_detail_item(item, Mode::Normal);
                     }
                 }
                 KeyCode::Char('a') => self.mode = Mode::AddTab,
                 KeyCode::Char('c') => {
-                    self.mode = Mode::Compose;
-                    self.status = format!("{} image(s) attached.", self.attachments.len());
+                    self.resume_draft();
+                }
+                KeyCode::Char('R') => {
+                    if let Some(item) = self.selected().cloned() {
+                        self.start_reply(item);
+                    }
                 }
                 KeyCode::Char('r') => self.refresh(self.tabs[self.active].kind),
                 KeyCode::Char('f') => self.action(false),
@@ -1240,7 +1601,7 @@ impl App {
                     })
                     .unwrap_or(0);
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_detail(),
                     KeyCode::Char('j') => {
                         self.detail_index = (self.detail_index + 1).min(count.saturating_sub(1))
                     }
@@ -1249,7 +1610,25 @@ impl App {
                     KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                     KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
                     KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+                    KeyCode::Char('t') => {
+                        if let Some(id) = self
+                            .selected()
+                            .map(|item| item.id.clone())
+                            .filter(|id| !id.is_empty())
+                        {
+                            self.load_thread(false);
+                            self.thread_stack.push(id);
+                            self.mode = Mode::Thread;
+                        }
+                    }
+                    KeyCode::Char('r') => self.load_thread(true),
                     KeyCode::Char('f') => self.follow_selected(),
+                    KeyCode::Char('c') => self.resume_draft(),
+                    KeyCode::Char('R') => {
+                        if let Some(item) = self.selected().cloned() {
+                            self.start_reply(item);
+                        }
+                    }
                     KeyCode::Enter
                         if self.selected().is_some_and(|item| {
                             self.detail_index < item.detail_account_count()
@@ -1278,37 +1657,125 @@ impl App {
                     _ => {}
                 }
             }
-            Mode::Profile => match key.code {
+            Mode::Thread => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
+                    self.thread_stack.pop();
                     self.mode = Mode::Detail;
-                    self.profile = None;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if let Some(p) = &mut self.profile {
-                        p.scroll = p.scroll.saturating_add(1)
+                    if let Some(state) = self
+                        .thread_stack
+                        .last()
+                        .and_then(|id| self.threads.get_mut(id))
+                    {
+                        state.selected =
+                            (state.selected + 1).min(state.entries.len().saturating_sub(1));
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(state) = self
+                        .thread_stack
+                        .last()
+                        .and_then(|id| self.threads.get_mut(id))
+                    {
+                        state.selected = state.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = self.selected_thread_item() {
+                        self.open_detail_item(item, Mode::Thread);
+                    }
+                }
+                KeyCode::Char('R') => {
+                    if let Some(item) = self.selected_thread_item() {
+                        self.start_reply(item);
+                    }
+                }
+                KeyCode::Char('c') => self.resume_draft(),
+                KeyCode::Char('r') => self.load_thread(true),
+                _ => {}
+            },
+            Mode::Profile => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = Mode::Detail;
+                    self.profile = self.profile_history.pop();
+                }
+                KeyCode::Char('j') => {
                     if let Some(p) = &mut self.profile {
-                        p.scroll = p.scroll.saturating_sub(1)
+                        p.selected = (p.selected + 1).min(p.posts.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Char('k') => {
+                    if let Some(p) = &mut self.profile {
+                        p.selected = p.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = self
+                        .profile
+                        .as_ref()
+                        .and_then(|p| p.posts.get(p.selected))
+                        .cloned()
+                    {
+                        self.open_detail_item(item, Mode::Profile);
+                    }
+                }
+                KeyCode::Char('R') => {
+                    if let Some(item) = self
+                        .profile
+                        .as_ref()
+                        .and_then(|p| p.posts.get(p.selected))
+                        .cloned()
+                    {
+                        self.start_reply(item);
+                    }
+                }
+                KeyCode::Char('c') => self.resume_draft(),
+                KeyCode::Down => {
+                    if let Some(p) = &mut self.profile {
+                        p.scroll = p.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Up => {
+                    if let Some(p) = &mut self.profile {
+                        p.scroll = p.scroll.saturating_sub(1);
                     }
                 }
                 KeyCode::PageDown => {
                     if let Some(p) = &mut self.profile {
-                        p.scroll = p.scroll.saturating_add(10)
+                        p.scroll = p.scroll.saturating_add(10);
                     }
                 }
                 KeyCode::PageUp => {
                     if let Some(p) = &mut self.profile {
-                        p.scroll = p.scroll.saturating_sub(10)
+                        p.scroll = p.scroll.saturating_sub(10);
                     }
                 }
                 KeyCode::Char('n') => self.load_profile_posts(),
                 _ => {}
             },
             Mode::Compose => {
-                if key.code == KeyCode::Esc && !self.busy {
-                    self.mode = Mode::Normal;
+                let discard_key =
+                    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d');
+                if !discard_key {
+                    self.discard_armed = false;
+                }
+                if discard_key && !self.busy {
+                    if self.discard_armed {
+                        self.input.clear();
+                        self.input_cursor = 0;
+                        self.attachments.clear();
+                        self.reply_draft = None;
+                        self.discard_armed = false;
+                        self.mode = self.compose_return;
+                        self.status = "Draft discarded.".into();
+                    } else {
+                        self.discard_armed = true;
+                        self.status =
+                            "Press Ctrl-D again to discard this draft and its attachments.".into();
+                    }
+                } else if key.code == KeyCode::Esc && !self.busy {
+                    self.mode = self.compose_return;
                     self.status = "Draft retained. Press c to resume.".into();
                 } else if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('v')
@@ -1330,7 +1797,19 @@ impl App {
                     && key.code == KeyCode::Char('s')
                     && !self.busy
                 {
-                    if self.input.trim().is_empty() && self.attachments.is_empty() {
+                    if self
+                        .reply_draft
+                        .as_ref()
+                        .is_some_and(|d| d.visibility.is_none())
+                    {
+                        self.status = "Still checking reply visibility and recipients.".into();
+                    } else if (self.input.trim().is_empty()
+                        || self.reply_draft.as_ref().is_some_and(|d| {
+                            !d.mention_prefix.is_empty()
+                                && self.input.trim() == d.mention_prefix.trim()
+                        }))
+                        && self.attachments.is_empty()
+                    {
                         self.status = "Write a post or attach an image first.".into();
                     } else {
                         self.busy = true;
@@ -1339,6 +1818,11 @@ impl App {
                         let config = self.config.clone();
                         let text = self.input.clone();
                         let attachments = self.attachments.clone();
+                        let reply_to = self.reply_draft.as_ref().map(|target| target.id.clone());
+                        let visibility = self
+                            .reply_draft
+                            .as_ref()
+                            .and_then(|target| target.visibility.clone());
                         thread::spawn(move || {
                             let result = (|| -> Result<()> {
                                 let client = Mastodon::new(config)?;
@@ -1346,7 +1830,12 @@ impl App {
                                 for bytes in attachments {
                                     ids.push(client.upload_media(bytes, "clipboard.png")?.id);
                                 }
-                                client.post(&text, &ids, None)?;
+                                client.post(
+                                    &text,
+                                    &ids,
+                                    reply_to.as_deref(),
+                                    visibility.as_deref(),
+                                )?;
                                 Ok(())
                             })()
                             .map_err(|e| format!("{e:#}"));
@@ -1589,9 +2078,18 @@ impl Workspace {
                     })
                     .map(|(i, _)| i)
                     .collect::<Vec<_>>();
-                let has_draft = |app: &App| !app.input.is_empty() || !app.attachments.is_empty();
+                let has_draft = |app: &App| {
+                    !app.input.is_empty()
+                        || !app.attachments.is_empty()
+                        || app.reply_draft.is_some()
+                };
                 if discarded.iter().any(|&i| {
                     self.sessions[i].app.busy
+                        || self.sessions[i]
+                            .app
+                            .reply_draft
+                            .as_ref()
+                            .is_some_and(|d| d.visibility.is_none())
                         || self.sessions[i].app.account_busy
                         || !self.sessions[i].app.pending_interactions.is_empty()
                         || !self.sessions[i].app.follow_requests.is_empty()
@@ -1623,6 +2121,11 @@ impl Workspace {
                     .find(|&i| has_draft(&self.sessions[i].app));
                 if old_index.is_some_and(|i| {
                     self.sessions[i].app.busy
+                        || self.sessions[i]
+                            .app
+                            .reply_draft
+                            .as_ref()
+                            .is_some_and(|d| d.visibility.is_none())
                         || !self.sessions[i].app.pending_interactions.is_empty()
                         || !self.sessions[i].app.follow_requests.is_empty()
                 }) {
@@ -1649,6 +2152,7 @@ impl Workspace {
                         std::mem::take(&mut app.input),
                         app.input_cursor,
                         std::mem::take(&mut app.attachments),
+                        app.reply_draft.take(),
                     )
                 });
                 for entry in &candidate.accounts {
@@ -1673,6 +2177,7 @@ impl Workspace {
                             replacement.app.input_cursor = previous.app.input_cursor;
                             replacement.app.attachments =
                                 std::mem::take(&mut previous.app.attachments);
+                            replacement.app.reply_draft = previous.app.reply_draft.take();
                             for kind in [Kind::Local, Kind::Federated] {
                                 if replacement.app.tabs.iter().any(|t| t.kind == kind) {
                                     let stream_kind = if kind == Kind::Local {
@@ -1690,10 +2195,13 @@ impl Workspace {
                                 }
                             }
                         }
-                        if let Some((input, cursor, attachments)) = transferred_draft.clone() {
+                        if let Some((input, cursor, attachments, reply_draft)) =
+                            transferred_draft.clone()
+                        {
                             replacement.app.input = input;
                             replacement.app.input_cursor = cursor;
                             replacement.app.attachments = attachments;
+                            replacement.app.reply_draft = reply_draft;
                         }
                         replacement.app.settings = preferences.clone();
                         self.sessions.push(replacement);
@@ -1728,6 +2236,11 @@ impl Workspace {
                 if let Some(target) = self.sessions.iter().position(|s| s.id == real_id) {
                     if self.sessions[source].app.busy
                         || self.sessions[target].app.busy
+                        || self.sessions[source]
+                            .app
+                            .reply_draft
+                            .as_ref()
+                            .is_some_and(|d| d.visibility.is_none())
                         || self.sessions[source].app.account_busy
                         || !self.sessions[source].app.pending_actions.is_empty()
                         || !self.sessions[source].app.pending_interactions.is_empty()
@@ -1742,9 +2255,11 @@ impl Workspace {
                         return false;
                     }
                     let source_has_draft = !self.sessions[source].app.input.is_empty()
-                        || !self.sessions[source].app.attachments.is_empty();
+                        || !self.sessions[source].app.attachments.is_empty()
+                        || self.sessions[source].app.reply_draft.is_some();
                     let target_has_draft = !self.sessions[target].app.input.is_empty()
-                        || !self.sessions[target].app.attachments.is_empty();
+                        || !self.sessions[target].app.attachments.is_empty()
+                        || self.sessions[target].app.reply_draft.is_some();
                     if source_has_draft && target_has_draft {
                         self.error(
                             source,
@@ -1774,9 +2289,11 @@ impl Workspace {
                         let cursor = self.sessions[source].app.input_cursor;
                         let attachments =
                             std::mem::take(&mut self.sessions[source].app.attachments);
+                        let reply_draft = self.sessions[source].app.reply_draft.take();
                         self.sessions[target].app.input = text;
                         self.sessions[target].app.input_cursor = cursor;
                         self.sessions[target].app.attachments = attachments;
+                        self.sessions[target].app.reply_draft = reply_draft;
                     }
                     self.sessions.remove(source);
                     self.store = candidate;
@@ -1926,6 +2443,8 @@ pub(crate) fn test_app() -> App {
         acct: "alice@example.com".into(),
         account_id: "1".into(),
         reply_to_id: None,
+        visibility: "public".into(),
+        mentions: vec![],
         content: "Hello from Alice".into(),
         timestamp: "2026-01-01".into(),
         context: String::new(),
@@ -1945,6 +2464,362 @@ pub(crate) fn test_app() -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reply_visibility_never_exceeds_original_or_account_preference() {
+        let values = ["direct", "private", "unlisted", "public"];
+        for (original_rank, original) in values.iter().enumerate() {
+            for (preferred_rank, preferred) in values.iter().enumerate() {
+                assert_eq!(
+                    reply_visibility(original, Some(preferred)),
+                    values[original_rank.min(preferred_rank)]
+                );
+            }
+        }
+        assert_eq!(reply_visibility("public", None), "direct");
+        assert_eq!(
+            reply_visibility("future-visibility", Some("public")),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn reply_draft_preserves_target_and_prevents_accidental_retargeting() {
+        let mut app = test_app();
+        let mut original = app.tabs[0].items[0].clone();
+        original.mentions = vec![
+            api::Mention {
+                id: "me".into(),
+                acct: "me".into(),
+            },
+            api::Mention {
+                id: "2".into(),
+                acct: "bob@example.com".into(),
+            },
+            api::Mention {
+                id: "2".into(),
+                acct: "bob@example.com".into(),
+            },
+        ];
+        app.mode = Mode::Detail;
+        app.start_reply(original.clone());
+        app.insert_text("こんにちは");
+        let generation = app.reply_draft.as_ref().unwrap().generation;
+        app.handle(Message::ReplyIdentity(
+            generation,
+            Ok(Account {
+                id: "me".into(),
+                acct: "me".into(),
+                source: Some(api::AccountSource {
+                    privacy: "private".into(),
+                }),
+                ..Account::default()
+            }),
+        ));
+        assert_eq!(app.input, "@alice@example.com @bob@example.com こんにちは");
+        assert_eq!(app.input_cursor, app.input.len());
+        assert_eq!(
+            app.reply_draft.as_ref().unwrap().visibility.as_deref(),
+            Some("private")
+        );
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Detail);
+        let mut other = original.clone();
+        other.id = "other".into();
+        app.start_reply(other);
+        assert!(app.mode == Mode::Detail);
+        assert_eq!(app.reply_draft.as_ref().unwrap().id, "1");
+        app.start_reply(original);
+        assert!(app.mode == Mode::Compose);
+        assert!(app.input.ends_with("こんにちは"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.mode == Mode::Compose);
+        assert_eq!(app.reply_draft.as_ref().unwrap().id, "1");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Detail);
+    }
+
+    #[test]
+    fn stale_identity_does_not_change_new_reply() {
+        let mut app = test_app();
+        let original = app.tabs[0].items[0].clone();
+        app.start_reply(original.clone());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut other = original;
+        other.id = "other".into();
+        app.start_reply(other);
+        app.handle(Message::ReplyIdentity(1, Err("late".into())));
+        assert_eq!(app.reply_draft.as_ref().unwrap().id, "other");
+        assert!(app.reply_draft.as_ref().unwrap().visibility.is_none());
+        app.handle(Message::ReplyIdentity(2, Err("offline".into())));
+        assert_eq!(
+            app.reply_draft.as_ref().unwrap().visibility.as_deref(),
+            Some("direct")
+        );
+    }
+
+    #[test]
+    fn reply_to_own_post_does_not_mention_self() {
+        let mut app = test_app();
+        let mut own_post = app.tabs[0].items[0].clone();
+        own_post.account_id = "me".into();
+        own_post.acct = "me".into();
+        own_post.visibility = "private".into();
+        app.start_reply(own_post);
+        app.handle(Message::ReplyIdentity(
+            1,
+            Ok(Account {
+                id: "me".into(),
+                acct: "me".into(),
+                source: Some(api::AccountSource {
+                    privacy: "public".into(),
+                }),
+                ..Account::default()
+            }),
+        ));
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.reply_draft.as_ref().unwrap().visibility.as_deref(),
+            Some("private")
+        );
+    }
+
+    #[test]
+    fn discarding_a_draft_requires_two_consecutive_actions() {
+        let mut app = test_app();
+        app.mode = Mode::Compose;
+        app.input = "draft".into();
+        app.input_cursor = app.input.len();
+        app.attachments.push(vec![1]);
+        let discard = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        app.key(discard);
+        assert_eq!(app.input, "draft");
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(discard);
+        assert_eq!(app.input, "draft");
+        app.key(discard);
+        assert!(app.input.is_empty());
+        assert!(app.attachments.is_empty());
+        assert!(app.mode == Mode::Normal);
+    }
+
+    #[test]
+    fn replies_are_tree_ordered_and_invalid_graphs_are_bounded() {
+        fn post(id: &str, parent: &str) -> Status {
+            Status {
+                id: id.into(),
+                in_reply_to_id: Some(parent.into()),
+                ..Default::default()
+            }
+        }
+        let entries = thread_entries(
+            "root",
+            vec![
+                post("grandchild", "first"),
+                post("first", "root"),
+                post("second", "root"),
+                post("first", "root"),
+                post("cycle-a", "cycle-b"),
+                post("cycle-b", "cycle-a"),
+                post("self", "self"),
+            ],
+        );
+        let ids: Vec<_> = entries.iter().map(|entry| entry.item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "first",
+                "grandchild",
+                "second",
+                "self",
+                "cycle-a",
+                "cycle-b"
+            ]
+        );
+        assert!(entries[1].prefix.contains("│"));
+        assert_eq!(
+            thread_entries(
+                "root",
+                (0..600).map(|i| post(&format!("{i}"), "root")).collect()
+            )
+            .len(),
+            500
+        );
+        let mut deep = vec![post("0", "root")];
+        for n in 1..50 {
+            deep.push(post(&n.to_string(), &(n - 1).to_string()));
+        }
+        let deep = thread_entries("root", deep);
+        assert_eq!(deep.len(), 50);
+        assert!(deep.iter().all(|entry| entry.prefix.chars().count() <= 27));
+    }
+
+    #[test]
+    fn nested_thread_detail_returns_to_previous_selection() {
+        let mut app = test_app();
+        let root = app.tabs[0].items[0].clone();
+        app.open_detail_item(root, Mode::Normal);
+        let reply = Status {
+            id: "child".into(),
+            in_reply_to_id: Some("1".into()),
+            ..Default::default()
+        };
+        let generation = app.threads["1"].generation;
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            generation,
+            Ok(vec![reply]),
+        ));
+        app.key(KeyEvent::from(KeyCode::Char('t')));
+        app.key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.mode == Mode::Detail);
+        assert_eq!(app.selected().unwrap().id, "child");
+        app.key(KeyEvent::from(KeyCode::Char('t')));
+        app.key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.selected().unwrap().id, "child");
+        app.key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.mode == Mode::Thread);
+        assert_eq!(app.selected_thread_item().unwrap().id, "child");
+        app.key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.mode == Mode::Detail);
+        assert_eq!(app.selected().unwrap().id, "1");
+    }
+
+    #[test]
+    fn detail_r_reloads_replies() {
+        let mut app = test_app();
+        app.open_detail_item(app.tabs[0].items[0].clone(), Mode::Normal);
+        let generation = app.threads["1"].generation;
+        app.key(KeyEvent::from(KeyCode::Char('r')));
+        assert_ne!(app.threads["1"].generation, generation);
+    }
+
+    #[test]
+    fn thread_refresh_restores_selected_post_after_reorder_and_retry() {
+        fn post(id: &str) -> Status {
+            Status {
+                id: id.into(),
+                in_reply_to_id: Some("1".into()),
+                ..Default::default()
+            }
+        }
+        let mut app = test_app();
+        app.open_detail_item(app.tabs[0].items[0].clone(), Mode::Normal);
+        let generation = app.threads["1"].generation;
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            generation,
+            Ok(vec![post("a"), post("b")]),
+        ));
+        app.threads.get_mut("1").unwrap().selected = 1;
+        app.mode = Mode::Thread;
+        app.thread_stack.push("1".into());
+        app.refresh_after_reply("b");
+        let generation = app.threads["1"].generation;
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            generation,
+            Err("offline".into()),
+        ));
+        app.load_thread(true);
+        let generation = app.threads["1"].generation;
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            generation,
+            Ok(vec![post("x"), post("a"), post("b")]),
+        ));
+        assert_eq!(app.selected_thread_item().unwrap().id, "b");
+        app.refresh_after_reply("1");
+        let generation = app.threads["1"].generation;
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            generation,
+            Ok(vec![post("x"), post("a")]),
+        ));
+        assert_eq!(app.selected_thread_item().unwrap().id, "x");
+    }
+
+    #[test]
+    fn forced_thread_refresh_rejects_older_inflight_response() {
+        let mut app = test_app();
+        let root = app.tabs[0].items[0].clone();
+        app.open_detail_item(root, Mode::Normal);
+        let older = app.threads["1"].generation;
+        assert!(app.threads["1"].loading);
+        app.load_thread(true);
+        let explicit = app.threads["1"].generation;
+        assert_ne!(older, explicit);
+        app.mode = Mode::Thread;
+        app.thread_stack.push("1".into());
+        app.refresh_after_reply("child");
+        let newer = app.threads["1"].generation;
+        assert_ne!(explicit, newer);
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            older,
+            Ok(vec![Status {
+                id: "stale".into(),
+                ..Default::default()
+            }]),
+        ));
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            explicit,
+            Ok(vec![Status {
+                id: "stale".into(),
+                ..Default::default()
+            }]),
+        ));
+        assert!(app.threads["1"].loading);
+        app.handle(Message::ThreadLoaded(
+            "1".into(),
+            newer,
+            Ok(vec![Status {
+                id: "new".into(),
+                ..Default::default()
+            }]),
+        ));
+        assert_eq!(app.threads["1"].entries[0].item.id, "new");
+    }
+
+    #[test]
+    fn thread_responses_cannot_replace_another_request_or_session() {
+        let mut first = test_app();
+        let second = test_app();
+        first.threads.insert(
+            "post".into(),
+            ThreadState {
+                entries: vec![],
+                selected: 0,
+                loading: true,
+                error: None,
+                truncated: false,
+                pending_selection: None,
+                generation: 2,
+            },
+        );
+        first.handle(Message::ThreadLoaded(
+            "post".into(),
+            1,
+            Ok(vec![Status {
+                id: "stale".into(),
+                ..Default::default()
+            }]),
+        ));
+        assert!(first.threads["post"].loading);
+        first.handle(Message::ThreadLoaded(
+            "post".into(),
+            2,
+            Ok(vec![Status {
+                id: "reply".into(),
+                in_reply_to_id: Some("post".into()),
+                ..Default::default()
+            }]),
+        ));
+        assert_eq!(first.threads["post"].entries[0].item.id, "reply");
+        assert!(second.threads.is_empty());
+    }
+
     fn profile_fixture(generation: u64) -> Profile {
         Profile {
             account: None,
@@ -1954,6 +2829,7 @@ mod tests {
             loading_posts: true,
             has_more: true,
             scroll: 0,
+            selected: 0,
             id: "42".into(),
             next_id: None,
             generation,
@@ -1995,6 +2871,7 @@ mod tests {
             "alice"
         );
         assert!(second.profile.as_ref().unwrap().account.is_none());
+        // A response can arrive while a profile post is open in details.
         first.mode = Mode::Detail;
         first.handle(Message::ProfilePosts(
             2,
@@ -2003,7 +2880,10 @@ mod tests {
                 ..Default::default()
             }]),
         ));
-        assert!(first.profile.as_ref().unwrap().posts.is_empty());
+        assert_eq!(first.profile.as_ref().unwrap().posts.len(), 1);
+        first.profile = None;
+        first.handle(Message::ProfilePosts(2, Ok(vec![Status::default()])));
+        assert!(first.profile.is_none());
     }
 
     #[test]
@@ -2043,6 +2923,100 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.mode == Mode::Detail);
         assert!(app.profile.is_none());
+    }
+
+    #[test]
+    fn profile_selection_opens_its_post_and_restores_both_views() {
+        let mut app = test_app();
+        app.open_detail_item(app.tabs[0].items[0].clone(), Mode::Normal);
+        app.detail_index = 2;
+        app.detail_scroll = 4;
+        app.mode = Mode::Profile;
+        let mut profile = profile_fixture(1);
+        profile.posts = (0..3)
+            .map(|i| {
+                view(
+                    Status {
+                        id: format!("profile-{i}"),
+                        content: format!("<p>Profile post {i}</p>"),
+                        ..Default::default()
+                    },
+                    String::new(),
+                )
+            })
+            .collect();
+        app.profile = Some(profile);
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Detail);
+        assert_eq!(app.selected().unwrap().id, "profile-1");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Profile);
+        assert_eq!(app.profile.as_ref().unwrap().selected, 1);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Detail);
+        assert_eq!(app.selected().unwrap().id, app.tabs[0].items[0].id);
+        assert_eq!((app.detail_index, app.detail_scroll), (2, 4));
+    }
+
+    #[test]
+    fn profile_selection_is_visible_and_user_names_are_coloured_in_all_themes() {
+        use ratatui::style::Color;
+        for theme in [
+            settings::Theme::Dark,
+            settings::Theme::Light,
+            settings::Theme::HighContrast,
+        ] {
+            let mut app = test_app();
+            app.mode = Mode::Profile;
+            app.settings.theme = theme;
+            let mut profile = profile_fixture(1);
+            profile.account = Some(Account {
+                acct: "person@example.com".into(),
+                ..Default::default()
+            });
+            profile.posts = (0..20)
+                .map(|i| {
+                    view(
+                        Status {
+                            id: i.to_string(),
+                            account: Account {
+                                acct: format!("user{i}@example.com"),
+                                display_name: format!("User {i}"),
+                                ..Default::default()
+                            },
+                            content: format!("<p>Post {i}</p>"),
+                            ..Default::default()
+                        },
+                        String::new(),
+                    )
+                })
+                .collect();
+            profile.selected = 19;
+            app.profile = Some(profile);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = (0..buffer.area.height)
+                .find(|&y| {
+                    let text: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    text.contains("User 19")
+                })
+                .expect("selected post is kept visible");
+            let marker = (0..buffer.area.width)
+                .find(|&x| buffer[(x, row)].symbol() == "▌")
+                .expect("selection marker");
+            assert_ne!(buffer[(marker + 2, row)].bg, Color::Reset);
+            let name = (marker..buffer.area.width)
+                .find(|&x| buffer[(x, row)].symbol() == "U")
+                .unwrap();
+            assert_ne!(buffer[(name, row)].fg, Color::Reset);
+        }
     }
 
     #[test]
@@ -2098,6 +3072,7 @@ mod tests {
         assert!(contents.contains("Joined: 2020-01-01"));
         assert!(contents.contains("n load 40 more"));
         app.profile.as_mut().unwrap().scroll = u16::MAX;
+        app.profile.as_mut().unwrap().selected = 19;
         terminal
             .draw(|frame| crate::ui::draw(frame, &mut app))
             .unwrap();

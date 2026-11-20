@@ -183,7 +183,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Style::default().fg(p.warning),
         )),
         Line::from(Span::styled(
-            "j/k move  h/l tab  Enter details  a add  c compose  f favourite  b boost  s settings  ? help  q quit",
+            "j/k move  h/l tab  Enter details  R reply  a add  c compose  f favourite  b boost  s settings  ? help  q quit",
             Style::default().fg(p.muted),
         )),
     ]);
@@ -208,6 +208,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Mode::Compose => draw_compose(frame, app, p),
         Mode::Detail => draw_detail_popup(frame, app, p),
         Mode::Profile => draw_profile_popup(frame, app, p),
+        Mode::Thread => draw_thread_popup(frame, app, p),
         Mode::Settings => draw_settings(frame, app, p),
         Mode::AccountManage => draw_accounts(frame, app, p),
         Mode::AccountAdd => draw_account_add(frame, app, p),
@@ -642,7 +643,15 @@ fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect, p: Palette) {
 fn draw_compose(frame: &mut Frame<'_>, app: &App, p: Palette) {
     let area = centered_rect(80, 75, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(" New post ", true, p);
+    let block = panel(
+        if app.reply_draft.is_some() {
+            " Reply "
+        } else {
+            " New post "
+        },
+        true,
+        p,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let sections = Layout::default()
@@ -655,10 +664,31 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App, p: Palette) {
         ])
         .split(inner);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Posting as ", Style::default().fg(p.muted)),
-            Span::styled(&app.account, Style::default().fg(p.accent)),
-        ])),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Posting as ", Style::default().fg(p.muted)),
+                Span::styled(&app.account, Style::default().fg(p.accent)),
+            ]),
+            app.reply_draft
+                .as_ref()
+                .map(|reply| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "Visibility: {}",
+                                reply.visibility.as_deref().unwrap_or("checking…")
+                            ),
+                            Style::default().fg(p.warning),
+                        ),
+                        Span::styled("  ·  Replying to ", Style::default().fg(p.muted)),
+                        Span::styled(
+                            format!("@{} ({})", reply.acct.trim_start_matches('@'), reply.author),
+                            Style::default().fg(p.accent),
+                        ),
+                    ])
+                })
+                .unwrap_or_default(),
+        ]),
         sections[0],
     );
     let width = sections[1].width.saturating_sub(2).max(2) as usize;
@@ -699,9 +729,11 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App, p: Palette) {
         sections[2],
     );
     frame.render_widget(
-        Paragraph::new("Ctrl-S: send  ·  Ctrl-V: attach image  ·  Esc: keep draft")
-            .style(Style::default().fg(p.accent))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(
+            "Ctrl-S: send  ·  Ctrl-V: attach image  ·  Esc: keep draft  ·  Ctrl-D twice: discard",
+        )
+        .style(Style::default().fg(p.accent))
+        .wrap(Wrap { trim: true }),
         sections[3],
     );
 }
@@ -765,9 +797,17 @@ fn draw_profile_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
     let block = panel(" Profile · Esc back ", true, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let header_height = (inner.height / 3)
+        .clamp(3, 10)
+        .min(inner.height.saturating_sub(4));
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ])
         .split(inner);
     let mut lines = Vec::new();
     if let Some(account) = &profile.account {
@@ -823,43 +863,6 @@ fn draw_profile_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
     } else {
         lines.push(Line::from("Loading profile…"));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("Posts · {} loaded", profile.posts.len()),
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-    )));
-    for post in &profile.posts {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{}  @{}  {}",
-                crate::links::display_text(&post.author, 200),
-                crate::links::display_text(&post.acct, 200),
-                crate::links::display_text(&post.timestamp, 40)
-            ),
-            Style::default().fg(p.muted),
-        )));
-        lines.extend(
-            post.content
-                .split('\n')
-                .map(|s| Line::from(mention_spans(s, p))),
-        );
-    }
-    lines.push(Line::from(""));
-    if profile.loading_posts {
-        lines.push(Line::from("Loading posts…"));
-    } else if let Some(error) = &profile.posts_error {
-        lines.push(Line::from(format!(
-            "Posts unavailable: {} · n: retry",
-            crate::links::display_text(error, 240)
-        )));
-    } else if profile.posts.is_empty() {
-        lines.push(Line::from("No posts available."));
-    } else if profile.has_more {
-        lines.push(Line::from("Press n to load up to 40 more posts."));
-    } else {
-        lines.push(Line::from("No more posts."));
-    }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let height = paragraph.line_count(sections[0].width);
     profile.scroll = profile.scroll.min(
@@ -868,19 +871,145 @@ fn draw_profile_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
             .min(u16::MAX as usize) as u16,
     );
     frame.render_widget(paragraph.scroll((profile.scroll, 0)), sections[0]);
+
+    let width = sections[1].width.saturating_sub(3) as usize;
+    let items: Vec<ListItem<'_>> = profile
+        .posts
+        .iter()
+        .map(|post| item_row(post, width, p, app.settings.density))
+        .collect();
+    let title = format!(" Posts · {} loaded ", profile.posts.len());
+    let list = List::new(items)
+        .block(panel(&title, true, p))
+        .highlight_style(selection_style(true, p))
+        .highlight_symbol("▌");
+    let mut state = ListState::default();
+    if !profile.posts.is_empty() {
+        state.select(Some(profile.selected.min(profile.posts.len() - 1)));
+    }
+    frame.render_stateful_widget(list, sections[1], &mut state);
+    let message = if profile.loading_posts {
+        "Loading posts…".to_owned()
+    } else if let Some(error) = &profile.posts_error {
+        format!(
+            "Posts unavailable: {} · n: retry",
+            crate::links::display_text(error, 240)
+        )
+    } else if profile.posts.is_empty() {
+        "No posts available.".to_owned()
+    } else if profile.has_more {
+        "Press n to load up to 40 more posts.".to_owned()
+    } else {
+        "No more posts.".to_owned()
+    };
     frame.render_widget(
-        Paragraph::new("j/k or ↑/↓ scroll · n load 40 more · Esc back")
-            .style(Style::default().fg(p.accent)),
+        Paragraph::new(message).style(Style::default().fg(p.muted)),
+        sections[2],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("j/k select · Enter details · R reply · c draft · Esc back"),
+            Line::from("↑/↓ profile scroll · PgUp/PgDown · n load 40 more"),
+        ])
+        .style(Style::default().fg(p.accent)),
+        sections[3],
+    );
+}
+
+fn draw_thread_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
+    let Some(state) = app.thread_stack.last().and_then(|id| app.threads.get(id)) else {
+        return;
+    };
+    let area = centered_rect(88, 85, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(" Replies · thread ", true, p);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    if state.loading {
+        frame.render_widget(
+            Paragraph::new("Loading replies…").style(Style::default().fg(p.muted)),
+            sections[0],
+        );
+    } else if let Some(error) = &state.error {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Could not load replies: {}",
+                crate::links::display_text(error, 200)
+            ))
+            .style(Style::default().fg(p.text))
+            .wrap(Wrap { trim: false }),
+            sections[0],
+        );
+    } else if state.entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No replies.").style(Style::default().fg(p.muted)),
+            sections[0],
+        );
+    } else {
+        let items: Vec<ListItem<'_>> = state
+            .entries
+            .iter()
+            .map(|entry| {
+                let author = crate::links::display_text(&entry.item.author, 100);
+                let content =
+                    crate::links::display_text(&entry.item.content.replace('\n', " "), 180);
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(entry.prefix.clone(), Style::default().fg(p.muted)),
+                        Span::styled(
+                            author,
+                            Style::default()
+                                .fg(account_color(&entry.item.acct, p))
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  @{}", crate::links::display_text(&entry.item.acct, 100)),
+                            Style::default().fg(p.muted),
+                        ),
+                    ]),
+                    Line::from(format!(
+                        "{}   {}",
+                        " ".repeat(entry.prefix.chars().count()),
+                        content
+                    )),
+                ])
+            })
+            .collect();
+        let list = List::new(items)
+            .style(Style::default().fg(p.text))
+            .highlight_style(
+                Style::default()
+                    .fg(p.text)
+                    .bg(p.selection)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▌ ");
+        let mut list_state = ListState::default();
+        list_state.select(Some(
+            state.selected.min(state.entries.len().saturating_sub(1)),
+        ));
+        frame.render_stateful_widget(list, sections[0], &mut list_state);
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("j/k select · Enter details · R reply · c draft · r reload · Esc back"),
+            Line::from(if state.truncated {
+                "Showing first 500 replies · nesting deeper than 8 is flattened"
+            } else {
+                "Up to 500 replies · nesting deeper than 8 is flattened"
+            }),
+        ])
+        .style(Style::default().fg(p.accent)),
         sections[1],
     );
 }
 
 fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
-    let Some(item) = app
-        .tabs
-        .get(app.active)
-        .and_then(|tab| tab.items.get(tab.selected))
-    else {
+    let Some(item) = app.selected().cloned() else {
         return;
     };
     let area = centered_rect(92, 90, frame.area());
@@ -959,6 +1088,41 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         )));
         lines.extend(preview.lines().map(|s| Line::from(s.to_owned())));
+    }
+    lines.push(Line::from(""));
+    if let Some(state) = app.threads.get(&item.id) {
+        let label = if state.loading {
+            "Replies: loading…".to_owned()
+        } else if state.error.is_some() {
+            "Replies unavailable · t to open, r to retry".to_owned()
+        } else if state.entries.is_empty() {
+            "No replies · t to open, r to reload".to_owned()
+        } else {
+            format!(
+                "Replies · {} shown{} · t to open thread",
+                state.entries.len(),
+                if state.truncated { " (first 500)" } else { "" }
+            )
+        };
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        )));
+        for entry in state.entries.iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled(entry.prefix.clone(), Style::default().fg(p.muted)),
+                Span::styled(
+                    crate::links::display_text(&entry.item.author, 50),
+                    Style::default()
+                        .fg(account_color(&entry.item.acct, p))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "  {}",
+                    crate::links::display_text(&entry.item.content.replace('\n', " "), 100)
+                )),
+            ]));
+        }
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -1044,8 +1208,8 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
     }
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("j/k select · Enter profile · f follow · Enter/o open"),
-            Line::from("↑/↓ PgUp/PgDown scroll post · Esc close"),
+            Line::from("j/k select · Enter profile · f follow · Enter/o open · R reply"),
+            Line::from("↑/↓ PgUp/PgDown scroll · t replies · r reload · c draft · Esc close"),
         ])
         .style(Style::default().fg(p.muted)),
         sections[2],
@@ -1378,15 +1542,17 @@ fn help_text<'a>() -> Vec<Line<'a>> {
         "Enter           Show post details, media and links",
         "a               Add local or federated timeline",
         "c               Compose a post",
+        "R               Reply to the selected post",
         "r               Refresh current timeline",
         "f / b           Toggle favourite / boost",
         "s               Settings (including accounts)",
         "?               Toggle this help",
         "q               Quit",
         "",
-        "Details: j/k select, f follows, Enter opens profile or media.",
-        "Profile: j/k scroll, n loads more posts, Esc goes back.",
+        "Details: j/k select, R reply, f follows, Enter opens profile or media.",
+        "Profile: j/k select, Enter details, R reply, n loads more.",
         "Compose: Ctrl-S sends, Ctrl-V attaches clipboard image.",
+        "Compose: Ctrl-D twice discards the draft and its attachments.",
         "Esc keeps the draft; press c to resume it.",
     ]
     .into_iter()

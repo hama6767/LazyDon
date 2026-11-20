@@ -200,6 +200,20 @@ pub struct Account {
     pub statuses_count: u64,
     pub created_at: String,
     pub fields: Vec<ProfileField>,
+    pub source: Option<AccountSource>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct AccountSource {
+    pub privacy: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Mention {
+    pub id: String,
+    pub acct: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -232,6 +246,7 @@ pub struct Status {
     pub url: Option<String>,
     pub content: String,
     pub account: Account,
+    pub mentions: Vec<Mention>,
     pub media_attachments: Vec<MediaAttachment>,
     pub card: Option<crate::links::Card>,
     pub reblog: Option<Box<Status>>,
@@ -240,6 +255,12 @@ pub struct Status {
     pub favourites_count: u64,
     pub favourited: Option<bool>,
     pub reblogged: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct StatusContext {
+    pub descendants: Vec<Status>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -306,6 +327,15 @@ impl Mastodon {
                 .send()?,
         )
     }
+    pub fn status_context(&self, id: &str) -> Result<StatusContext> {
+        let url = api_resource_url(&self.config.instance, "statuses", id, Some("context"))?;
+        decode(
+            self.client
+                .get(url)
+                .bearer_auth(&self.config.access_token)
+                .send()?,
+        )
+    }
     pub fn account(&self, id: &str) -> Result<Account> {
         let url = api_resource_url(&self.config.instance, "accounts", id, None)?;
         decode(
@@ -356,13 +386,22 @@ impl Mastodon {
                 .context("通知を取得できませんでした")?,
         )
     }
-    pub fn post(&self, text: &str, media_ids: &[String], reply_to: Option<&str>) -> Result<Status> {
+    pub fn post(
+        &self,
+        text: &str,
+        media_ids: &[String],
+        reply_to: Option<&str>,
+        visibility: Option<&str>,
+    ) -> Result<Status> {
         let mut fields = vec![("status", text.to_owned())];
         for id in media_ids {
             fields.push(("media_ids[]", id.clone()));
         }
         if let Some(id) = reply_to {
             fields.push(("in_reply_to_id", id.to_owned()));
+        }
+        if let Some(visibility) = visibility {
+            fields.push(("visibility", visibility.to_owned()));
         }
         decode(
             self.post_request("/api/v1/statuses")
