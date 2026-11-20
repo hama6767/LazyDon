@@ -1,15 +1,15 @@
 use crate::api::{Config, Mastodon, Notification, Status, Timeline};
-use crate::media;
 use crate::stream::{self, StreamEvent, StreamKind, StreamMessage};
+use crate::{links, media};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::text::Line;
 use std::{
     collections::HashMap,
     sync::mpsc::{self, Sender},
     thread,
     time::Duration,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -17,6 +17,7 @@ pub enum Mode {
     Compose,
     AddTab,
     Help,
+    Detail,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -31,6 +32,12 @@ pub struct Tab {
     pub selected: usize,
     kind: Kind,
 }
+#[derive(Clone, Debug)]
+pub struct Attachment {
+    pub kind: String,
+    pub url: String,
+    pub description: String,
+}
 #[derive(Clone)]
 pub struct ViewItem {
     pub id: String,
@@ -41,6 +48,11 @@ pub struct ViewItem {
     pub timestamp: String,
     pub context: String,
     pub media: Vec<String>,
+    pub attachments: Vec<Attachment>,
+    pub links: Vec<String>,
+    pub post_url: Option<String>,
+    pub details: String,
+    pub link_preview: Option<String>,
     favourite: bool,
     boosted: bool,
 }
@@ -50,7 +62,11 @@ pub struct App {
     pub status: String,
     pub mode: Mode,
     pub input: String,
-    pub preview: media::Preview,
+    pub input_cursor: usize,
+    pub detail_index: usize,
+    pub detail_scroll: u16,
+    pub native_preview: Option<media::NativePreview>,
+    picker: ratatui_image::picker::Picker,
     pub instance: String,
     pub account: String,
     config: Config,
@@ -65,7 +81,6 @@ pub struct App {
 enum Message {
     Loaded(Kind, u64, Result<Vec<ViewItem>, String>),
     Stream(StreamMessage),
-    Preview(String, Result<media::Preview, String>),
     Clipboard(Result<Vec<u8>, String>),
     Posted(Result<(), String>),
     Action(Result<(), String>),
@@ -108,6 +123,63 @@ fn view(status: Status, context: String) -> ViewItem {
         content = format!("CW: {}\n{}", status.spoiler_text, content);
     }
     let acct = status.account.acct.clone();
+    let mut urls = links::extract(&status.content);
+    let post_url = status.url.clone().filter(|url| links::valid_url(url));
+    let link_preview = status
+        .card
+        .as_ref()
+        .map(|card| {
+            let title = links::display_text(&card.title, 140);
+            let description = links::display_text(&card.description, 200);
+            let provider = links::display_text(&card.provider_name, 80);
+            [title, description, provider]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .filter(|s| !s.is_empty());
+    if let Some(url) = status
+        .card
+        .as_ref()
+        .map(|c| &c.url)
+        .filter(|url| links::valid_url(url))
+    {
+        if !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    }
+    if let Some(url) = &post_url {
+        if !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    }
+    let attachments = status
+        .media_attachments
+        .iter()
+        .filter_map(|m| {
+            m.url
+                .as_ref()
+                .filter(|url| links::valid_url(url))
+                .map(|url| Attachment {
+                    kind: m.kind.clone(),
+                    url: url.clone(),
+                    description: m.description.clone().unwrap_or_default(),
+                })
+        })
+        .collect();
+    let details = format!(
+        "{} · {} replies · {} boosts · {} favourites{}",
+        status.visibility,
+        status.replies_count,
+        status.reblogs_count,
+        status.favourites_count,
+        if status.sensitive {
+            " · sensitive"
+        } else {
+            ""
+        }
+    );
     ViewItem {
         id: status.id,
         key,
@@ -139,9 +211,17 @@ fn view(status: Status, context: String) -> ViewItem {
         media: status
             .media_attachments
             .into_iter()
-            .filter(|m| m.kind == "image")
-            .filter_map(|m| m.preview_url.or(m.url))
+            .filter_map(|m| match m.kind.as_str() {
+                "image" => m.url.or(m.preview_url),
+                "video" | "gifv" => m.preview_url,
+                _ => None,
+            })
             .collect(),
+        attachments,
+        links: urls,
+        post_url,
+        details,
+        link_preview,
         favourite: status.favourited.unwrap_or(false),
         boosted: status.reblogged.unwrap_or(false),
     }
@@ -166,6 +246,11 @@ fn notification(n: Notification) -> ViewItem {
             timestamp: n.created_at,
             context: "notification".into(),
             media: vec![],
+            attachments: vec![],
+            links: vec![],
+            post_url: None,
+            details: String::new(),
+            link_preview: None,
             favourite: false,
             boosted: false,
         }
@@ -219,6 +304,11 @@ fn apply_event(tab: &mut Tab, event: &StreamEvent) {
                     existing.acct = updated.acct.clone();
                     existing.content = updated.content.clone();
                     existing.media = updated.media.clone();
+                    existing.attachments = updated.attachments.clone();
+                    existing.links = updated.links.clone();
+                    existing.post_url = updated.post_url.clone();
+                    existing.details = updated.details.clone();
+                    existing.link_preview = updated.link_preview.clone();
                     existing.favourite = updated.favourite;
                     existing.boosted = updated.boosted;
                 }
@@ -259,7 +349,11 @@ impl App {
                 status: "Loading…".into(),
                 mode: Mode::Normal,
                 input: String::new(),
-                preview: vec![],
+                input_cursor: 0,
+                detail_index: 0,
+                detail_scroll: 0,
+                native_preview: None,
+                picker: ratatui_image::picker::Picker::from_fontsize((10, 20)),
                 instance: config.instance.clone(),
                 account,
                 config,
@@ -355,14 +449,7 @@ impl App {
             return;
         }
         self.preview_url = url.clone();
-        self.preview.clear();
-        if let Some(url) = url {
-            let tx = self.tx.clone();
-            thread::spawn(move || {
-                let result = media::preview(&url).map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Message::Preview(url, result));
-            });
-        }
+        self.native_preview = url.map(|url| media::NativePreview::start(self.picker, url));
     }
     fn selected(&self) -> Option<&ViewItem> {
         self.tabs
@@ -428,15 +515,6 @@ impl App {
                 }
             }
             Message::Stream(message) => self.handle_stream(message),
-            Message::Preview(url, result) if self.preview_url.as_ref() == Some(&url) => {
-                self.preview = result.unwrap_or_else(|e| {
-                    vec![
-                        Line::raw(format!("Preview unavailable: {e}")),
-                        Line::raw(url),
-                    ]
-                })
-            }
-            Message::Preview(_, _) => {}
             Message::Clipboard(result) => {
                 self.busy = false;
                 match result {
@@ -452,6 +530,7 @@ impl App {
                 match result {
                     Ok(()) => {
                         self.input.clear();
+                        self.input_cursor = 0;
                         self.attachments.clear();
                         self.mode = Mode::Normal;
                         self.refresh(Kind::Home);
@@ -469,6 +548,57 @@ impl App {
             },
         }
     }
+    fn insert_text(&mut self, text: &str) {
+        // Bracketed paste may contain CRLF or control bytes; keep only text, tabs and newlines.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let clean: String = text
+            .chars()
+            .filter(|&c| !c.is_control() || c == '\n' || c == '\t')
+            .collect();
+        self.input.insert_str(self.input_cursor, &clean);
+        self.input_cursor += clean.len();
+    }
+    fn prev_cursor(&self) -> usize {
+        self.input[..self.input_cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(i, _)| i)
+    }
+    fn next_cursor(&self) -> usize {
+        self.input_cursor
+            + self.input[self.input_cursor..]
+                .graphemes(true)
+                .next()
+                .map_or(0, str::len)
+    }
+    fn move_line(&mut self, direction: i8) {
+        let start = self.input[..self.input_cursor]
+            .rfind('\n')
+            .map_or(0, |i| i + 1);
+        let column = self.input[start..self.input_cursor].graphemes(true).count();
+        let target = if direction < 0 {
+            if start == 0 {
+                return;
+            }
+            let end = start - 1;
+            let begin = self.input[..end].rfind('\n').map_or(0, |i| i + 1);
+            (begin, end)
+        } else {
+            let Some(relative_end) = self.input[self.input_cursor..].find('\n') else {
+                return;
+            };
+            let begin = self.input_cursor + relative_end + 1;
+            let end = self.input[begin..]
+                .find('\n')
+                .map_or(self.input.len(), |i| begin + i);
+            (begin, end)
+        };
+        self.input_cursor = target.0
+            + self.input[target.0..target.1]
+                .grapheme_indices(true)
+                .nth(column)
+                .map_or(target.1 - target.0, |(i, _)| i);
+    }
     fn key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
@@ -480,6 +610,13 @@ impl App {
             Mode::Normal => match key.code {
                 KeyCode::Char('q') => return true,
                 KeyCode::Char('?') => self.mode = Mode::Help,
+                KeyCode::Enter => {
+                    if self.selected().is_some() {
+                        self.detail_index = 0;
+                        self.detail_scroll = 0;
+                        self.mode = Mode::Detail;
+                    }
+                }
                 KeyCode::Char('a') => self.mode = Mode::AddTab,
                 KeyCode::Char('c') => {
                     self.mode = Mode::Compose;
@@ -546,6 +683,44 @@ impl App {
                     self.mode = Mode::Normal;
                 }
             }
+            Mode::Detail => {
+                let count = self
+                    .selected()
+                    .map(|item| item.attachments.len() + item.links.len())
+                    .unwrap_or(0);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                    KeyCode::Char('j') => {
+                        self.detail_index = (self.detail_index + 1).min(count.saturating_sub(1))
+                    }
+                    KeyCode::Char('k') => self.detail_index = self.detail_index.saturating_sub(1),
+                    KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                    KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                    KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+                    KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+                    KeyCode::Enter | KeyCode::Char('o') => {
+                        let url = self.selected().and_then(|item| {
+                            if self.detail_index < item.attachments.len() {
+                                item.attachments
+                                    .get(self.detail_index)
+                                    .map(|a| a.url.clone())
+                            } else {
+                                item.links
+                                    .get(self.detail_index - item.attachments.len())
+                                    .cloned()
+                            }
+                        });
+                        self.status = match url {
+                            Some(url) => match links::open(&url) {
+                                Ok(()) => "Opening in your desktop application…".into(),
+                                Err(e) => format!("Cannot open: {e:#}"),
+                            },
+                            None => "No media or link selected.".into(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
             Mode::Compose => {
                 if key.code == KeyCode::Esc && !self.busy {
                     self.mode = Mode::Normal;
@@ -596,11 +771,31 @@ impl App {
                 } else if !self.busy {
                     match key.code {
                         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.input.push(c)
+                            self.insert_text(&c.to_string())
                         }
-                        KeyCode::Enter => self.input.push('\n'),
+                        KeyCode::Enter => self.insert_text("\n"),
+                        KeyCode::Left => self.input_cursor = self.prev_cursor(),
+                        KeyCode::Right => self.input_cursor = self.next_cursor(),
+                        KeyCode::Home => {
+                            self.input_cursor = self.input[..self.input_cursor]
+                                .rfind('\n')
+                                .map_or(0, |i| i + 1)
+                        }
+                        KeyCode::End => {
+                            self.input_cursor += self.input[self.input_cursor..]
+                                .find('\n')
+                                .unwrap_or(self.input.len() - self.input_cursor)
+                        }
+                        KeyCode::Up => self.move_line(-1),
+                        KeyCode::Down => self.move_line(1),
                         KeyCode::Backspace => {
-                            self.input.pop();
+                            let prev = self.prev_cursor();
+                            self.input.replace_range(prev..self.input_cursor, "");
+                            self.input_cursor = prev;
+                        }
+                        KeyCode::Delete => {
+                            let next = self.next_cursor();
+                            self.input.replace_range(self.input_cursor..next, "");
                         }
                         _ => {}
                     }
@@ -612,6 +807,7 @@ impl App {
 }
 pub fn run(terminal: &mut ratatui::DefaultTerminal, config: Config, account: String) -> Result<()> {
     let (mut app, rx) = App::new(config, account);
+    app.picker = media::image_picker();
     app.refresh(Kind::Home);
     app.refresh(Kind::Notifications);
     stream::start(app.config.clone(), StreamKind::User, app.stream_tx.clone());
@@ -622,12 +818,18 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, config: Config, account: Str
                 Err(_) => break,
             }
         }
-        terminal.draw(|f| crate::ui::draw(f, &app))?;
+        terminal.draw(|f| crate::ui::draw(f, &mut app))?;
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if app.key(key) {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.key(key) {
+                        break;
+                    }
                 }
+                Event::Paste(text) if app.mode == Mode::Compose && !app.busy => {
+                    app.insert_text(&text)
+                }
+                _ => {}
             }
         }
     }
@@ -650,10 +852,15 @@ pub(crate) fn test_app() -> App {
         timestamp: "2026-01-01".into(),
         context: String::new(),
         media: vec!["https://example.com/image.png".into()],
+        attachments: vec![],
+        links: vec![],
+        post_url: None,
+        details: String::new(),
+        link_preview: None,
         favourite: false,
         boosted: false,
     });
-    app.preview = vec![Line::raw("[preview]")];
+
     app
 }
 
@@ -677,6 +884,46 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Compose));
         assert_eq!(app.input, "あ");
+    }
+    #[test]
+    fn japanese_draft_paste_and_grapheme_editing() {
+        let mut app = test_app();
+        app.mode = Mode::Compose;
+        app.insert_text("日本語\r\nか\u{3099}き");
+        assert_eq!(app.input, "日本語\nか\u{3099}き");
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input, "日本語\nき");
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.insert_text("追加");
+        assert_eq!(app.input, "追加日本語\nき");
+        assert!(app.input.is_char_boundary(app.input_cursor));
+    }
+    #[test]
+    fn detail_lists_original_media_and_links() {
+        let status = Status {
+            id: "123".into(),
+            content: r#"<p><a href="https://example.com/article?a=1&amp;b=2">article</a></p>"#
+                .into(),
+            url: Some("https://example.com/@alice/123".into()),
+            media_attachments: vec![crate::api::MediaAttachment {
+                kind: "video".into(),
+                url: Some("https://example.com/original.mp4".into()),
+                preview_url: Some("https://example.com/thumbnail.jpg".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let item = view(status, String::new());
+        assert_eq!(item.attachments[0].url, "https://example.com/original.mp4");
+        assert_eq!(item.media[0], "https://example.com/thumbnail.jpg");
+        assert_eq!(item.links[0], "https://example.com/article?a=1&b=2");
+        let mut app = test_app();
+        app.tabs[0].items = vec![item];
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Detail);
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.detail_index, 1);
     }
     #[test]
     fn boost_displays_original_author_and_id() {

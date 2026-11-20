@@ -240,6 +240,7 @@ pub struct Status {
     pub content: String,
     pub account: Account,
     pub media_attachments: Vec<MediaAttachment>,
+    pub card: Option<crate::links::Card>,
     pub reblog: Option<Box<Status>>,
     pub replies_count: u64,
     pub reblogs_count: u64,

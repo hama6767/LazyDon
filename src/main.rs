@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod links;
 mod media;
 mod stream;
 mod ui;
@@ -49,7 +50,12 @@ fn main() -> Result<()> {
         .verify_credentials()
         .context("Account verification failed; run with --login to authenticate again")?;
     let mut terminal = ratatui::init();
-    let result = app::run(&mut terminal, config, format!("@{}", account.acct));
+    let enabled = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
+    let result = enabled
+        .context("Could not enable bracketed paste")
+        .and_then(|_| app::run(&mut terminal, config, format!("@{}", account.acct)));
+    let disabled = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
-    result
+    result?;
+    disabled.context("Could not restore terminal paste mode")
 }
