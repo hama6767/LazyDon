@@ -5,6 +5,7 @@
 use anyhow::{bail, Context, Result};
 use html2text::render::RichAnnotation;
 use serde::Deserialize;
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -91,6 +92,37 @@ pub fn open(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Copy the complete URL without relying on how the terminal wraps it.
+pub fn copy_to_clipboard(url: &str) -> Result<()> {
+    if !valid_url(url) {
+        bail!("Only HTTP(S) URLs without credentials can be copied");
+    }
+    let candidates: &[(&str, &[&str])] =
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+    for &(program, args) in candidates {
+        if copy_with_command(program, args, url).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("Could not copy URL; install wl-copy (Wayland) or xclip (X11)")
+}
+
+fn copy_with_command(program: &str, args: &[&str], url: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let write_result = child.stdin.take().unwrap().write_all(url.as_bytes());
+    let status = child.wait()?;
+    write_result?;
+    if !status.success() {
+        bail!("Clipboard command failed");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +140,18 @@ mod tests {
         assert!(!valid_url("https://user:password@example.org/"));
         assert!(!valid_url("https://example.org/\x1b[2J"));
         assert!(!valid_url("--help"));
+    }
+
+    #[test]
+    fn clipboard_receives_the_complete_url_without_shell_interpolation() {
+        let url = "https://example.org/oauth/authorize?client_id=a%2Bb&scope=read+write";
+        copy_with_command(
+            "sh",
+            &["-c", "value=$(cat); [ \"$value\" = 'https://example.org/oauth/authorize?client_id=a%2Bb&scope=read+write' ]"],
+            url,
+        )
+        .unwrap();
+        assert!(copy_to_clipboard("https://example.org/\nmalicious").is_err());
     }
 
     #[test]

@@ -287,11 +287,21 @@ impl AccountLock {
     }
 }
 
-// Ensure dropping the guard closes the descriptor and releases the lock.
+// Unlock explicitly before closing: a concurrent fork may briefly inherit the
+// open file description even though the descriptor is close-on-exec.
 #[cfg(unix)]
 impl Drop for AccountLock {
     fn drop(&mut self) {
-        let _ = &self.0;
+        use std::os::fd::AsRawFd;
+        extern "C" {
+            fn flock(
+                fd: std::os::raw::c_int,
+                operation: std::os::raw::c_int,
+            ) -> std::os::raw::c_int;
+        }
+        const LOCK_UN: i32 = 8;
+        // SAFETY: the descriptor remains open until after this drop method.
+        let _ = unsafe { flock(self.0.as_raw_fd(), LOCK_UN) };
     }
 }
 

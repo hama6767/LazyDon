@@ -207,6 +207,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ),
         Mode::Compose => draw_compose(frame, app, p),
         Mode::Detail => draw_detail_popup(frame, app, p),
+        Mode::Profile => draw_profile_popup(frame, app, p),
         Mode::Settings => draw_settings(frame, app, p),
         Mode::AccountManage => draw_accounts(frame, app, p),
         Mode::AccountAdd => draw_account_add(frame, app, p),
@@ -661,11 +662,7 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App, p: Palette) {
         sections[0],
     );
     let width = sections[1].width.saturating_sub(2).max(2) as usize;
-    let (mut draft_lines, cursor_row, cursor_col) =
-        draft_layout(&app.input, app.input_cursor, width);
-    if app.input.is_empty() {
-        draft_lines[0] = "Write your post here…".into();
-    }
+    let (draft_lines, cursor_row, cursor_col) = draft_layout(&app.input, app.input_cursor, width);
     let visible = sections[1].height.saturating_sub(2) as usize;
     let scroll = cursor_row
         .saturating_add(1)
@@ -675,15 +672,7 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App, p: Palette) {
     frame.render_widget(
         Paragraph::new(body)
             .block(panel(" Body · editing ", true, p))
-            .style(
-                Style::default()
-                    .fg(if app.input.is_empty() {
-                        p.muted
-                    } else {
-                        p.text
-                    })
-                    .bg(p.compose),
-            )
+            .style(Style::default().fg(p.text).bg(p.compose))
             .scroll((scroll, 0)),
         sections[1],
     );
@@ -767,6 +756,125 @@ fn draft_layout(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize,
     (lines, caret.0, caret.1)
 }
 
+fn draw_profile_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
+    let Some(profile) = app.profile.as_mut() else {
+        return;
+    };
+    let area = centered_rect(88, 88, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(" Profile · Esc back ", true, p);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let mut lines = Vec::new();
+    if let Some(account) = &profile.account {
+        let name = if account.display_name.is_empty() {
+            &account.acct
+        } else {
+            &account.display_name
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                crate::links::display_text(name, 200),
+                Style::default()
+                    .fg(account_color(&account.acct, p))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  @{}{}",
+                    crate::links::display_text(&account.acct, 200),
+                    if account.locked { " · Locked" } else { "" }
+                ),
+                Style::default().fg(p.muted),
+            ),
+        ]));
+        lines.push(Line::from(format!(
+            "{} posts · {} following · {} followers",
+            account.statuses_count, account.following_count, account.followers_count
+        )));
+        if !account.created_at.is_empty() {
+            lines.push(Line::from(format!(
+                "Joined: {}",
+                crate::links::display_text(&account.created_at, 40)
+            )));
+        }
+        let note = crate::formatting::plain(&account.note);
+        lines.extend(note.lines().map(|s| Line::from(s.to_owned())));
+        for field in &account.fields {
+            let name = crate::formatting::plain(&field.name);
+            let value = crate::formatting::plain(&field.value);
+            let mut field_lines = value.lines();
+            lines.push(Line::from(format!(
+                "{}: {}",
+                name.replace('\n', " "),
+                field_lines.next().unwrap_or_default()
+            )));
+            lines.extend(field_lines.map(|s| Line::from(s.to_owned())));
+        }
+    } else if let Some(error) = &profile.account_error {
+        lines.push(Line::from(format!(
+            "Profile unavailable: {} (reopen to retry)",
+            crate::links::display_text(error, 240)
+        )));
+    } else {
+        lines.push(Line::from("Loading profile…"));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("Posts · {} loaded", profile.posts.len()),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+    )));
+    for post in &profile.posts {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{}  @{}  {}",
+                crate::links::display_text(&post.author, 200),
+                crate::links::display_text(&post.acct, 200),
+                crate::links::display_text(&post.timestamp, 40)
+            ),
+            Style::default().fg(p.muted),
+        )));
+        lines.extend(
+            post.content
+                .split('\n')
+                .map(|s| Line::from(mention_spans(s, p))),
+        );
+    }
+    lines.push(Line::from(""));
+    if profile.loading_posts {
+        lines.push(Line::from("Loading posts…"));
+    } else if let Some(error) = &profile.posts_error {
+        lines.push(Line::from(format!(
+            "Posts unavailable: {} · n: retry",
+            crate::links::display_text(error, 240)
+        )));
+    } else if profile.posts.is_empty() {
+        lines.push(Line::from("No posts available."));
+    } else if profile.has_more {
+        lines.push(Line::from("Press n to load up to 40 more posts."));
+    } else {
+        lines.push(Line::from("No more posts."));
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = paragraph.line_count(sections[0].width);
+    profile.scroll = profile.scroll.min(
+        height
+            .saturating_sub(usize::from(sections[0].height))
+            .min(u16::MAX as usize) as u16,
+    );
+    frame.render_widget(paragraph.scroll((profile.scroll, 0)), sections[0]);
+    frame.render_widget(
+        Paragraph::new("j/k or ↑/↓ scroll · n load 40 more · Esc back")
+            .style(Style::default().fg(p.accent)),
+        sections[1],
+    );
+}
+
 fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
     let Some(item) = app
         .tabs
@@ -775,11 +883,48 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
     else {
         return;
     };
-    let area = centered_rect(88, 88, frame.area());
+    let area = centered_rect(92, 90, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(" Post details · Esc close ", true, p);
+    let block = panel(" Post details ", true, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    // Keep navigation and its hints visible while the post text scrolls. The
+    // selectable list has its own viewport, so j/k cannot lose the selection
+    // below a long post or a large number of links.
+    let (text_area, image_area) = if !item.media.is_empty()
+        && app.native_preview.is_some()
+        && inner.width >= 80
+        && inner.height >= 8
+    {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(inner);
+        (columns[0], Some(columns[1]))
+    } else {
+        (inner, None)
+    };
+    let account_count = item.detail_account_count();
+    let option_count = account_count + item.attachments.len() + item.links.len();
+    let options_height = if option_count == 0 {
+        0
+    } else {
+        (option_count as u16)
+            .saturating_add(2)
+            .clamp(3, 10)
+            .min(text_area.height.saturating_sub(5))
+    };
+    let footer_height = text_area.height.saturating_sub(options_height).min(2);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(options_height),
+            Constraint::Length(footer_height),
+        ])
+        .split(text_area);
+
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -788,13 +933,12 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
                     .fg(account_color(&item.acct, p))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" @{}", item.acct), Style::default().fg(p.muted)),
+            Span::styled(format!("  @{}", item.acct), Style::default().fg(p.muted)),
         ]),
         Line::from(Span::styled(
             format!("{}  {}", item.timestamp, item.context),
             Style::default().fg(p.muted),
         )),
-        Line::from(""),
     ];
     if !item.details.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -802,6 +946,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
             Style::default().fg(p.muted),
         )));
     }
+    lines.push(Line::from(""));
     lines.extend(
         item.content
             .split('\n')
@@ -811,73 +956,99 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Link preview",
-            Style::default().fg(p.accent),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         )));
         lines.extend(preview.lines().map(|s| Line::from(s.to_owned())));
     }
-    if !item.attachments.is_empty() || !item.links.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Media and links · j/k select · Enter/o open",
-            Style::default().fg(p.accent),
-        )));
-        for (i, attachment) in item.attachments.iter().enumerate() {
-            let marker = if app.detail_index == i { "▸" } else { " " };
-            let description = if attachment.description.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", attachment.description)
-            };
-            lines.push(Line::from(Span::styled(
-                format!("{} {} {}{}", marker, i + 1, attachment.kind, description),
-                if app.detail_index == i {
-                    Style::default().fg(p.warning).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            )));
-            lines.push(Line::from(format!("    {}", attachment.url)));
-        }
-        for (i, link) in item.links.iter().enumerate() {
-            let index = i + item.attachments.len();
-            let marker = if app.detail_index == index {
-                "▸"
-            } else {
-                " "
-            };
-            lines.push(Line::from(Span::styled(
-                format!("{} {} {}", marker, index + 1, link),
-                if app.detail_index == index {
-                    Style::default().fg(p.warning).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
-            )));
-        }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "↑/↓ PgUp/PgDown scroll · Esc close",
-        Style::default().fg(p.muted),
-    )));
-    let (text_area, image_area) = if !item.media.is_empty()
-        && app.native_preview.is_some()
-        && inner.width >= 80
-        && inner.height >= 8
-    {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-            .split(inner);
-        (columns[0], Some(columns[1]))
-    } else {
-        (inner, None)
-    };
     frame.render_widget(
         Paragraph::new(lines)
+            .style(Style::default().fg(p.text))
+            .block(panel(" Post · ↑/↓ scroll ", false, p))
             .wrap(Wrap { trim: false })
             .scroll((app.detail_scroll, 0)),
-        text_area,
+        sections[0],
+    );
+
+    let mut options = Vec::with_capacity(option_count);
+    if !item.account_id.is_empty() {
+        let state = if app.follow_requests.contains(&item.account_id) {
+            " · Following…".to_string()
+        } else {
+            app.follow_results
+                .get(&item.account_id)
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default()
+        };
+        options.push(ListItem::new(format!(
+            "Author: {} (@{}){}",
+            item.author, item.acct, state
+        )));
+    }
+    if let Some(reply_id) = &item.reply_to_id {
+        let label = match app.reply_targets.get(reply_id) {
+            Some(Ok(account)) => {
+                let state = if app.follow_requests.contains(&account.id) {
+                    " · Following…".to_string()
+                } else {
+                    app.follow_results
+                        .get(&account.id)
+                        .map(|s| format!(" · {s}"))
+                        .unwrap_or_default()
+                };
+                format!(
+                    "{} (@{}){}",
+                    if account.display_name.is_empty() {
+                        &account.acct
+                    } else {
+                        &account.display_name
+                    },
+                    account.acct,
+                    state
+                )
+            }
+            Some(Err(error)) => format!("Unavailable: {error} (reopen to retry)"),
+            None => "Loading…".into(),
+        };
+        options.push(ListItem::new(format!("Reply to: {label}")));
+    }
+    for (index, attachment) in item.attachments.iter().enumerate() {
+        let description = if attachment.description.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", attachment.description)
+        };
+        options.push(ListItem::new(format!(
+            "Media {}: {}{}",
+            index + 1,
+            attachment.kind,
+            description
+        )));
+    }
+    for (index, link) in item.links.iter().enumerate() {
+        options.push(ListItem::new(format!("Link {}: {link}", index + 1)));
+    }
+    if !options.is_empty() {
+        let list = List::new(options)
+            .block(panel(" Accounts · Media · Links ", false, p))
+            .style(Style::default().fg(p.text))
+            .highlight_style(
+                Style::default()
+                    .fg(p.text)
+                    .bg(p.selection)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▌ ");
+        let mut state = ListState::default();
+        state.select(Some(app.detail_index.min(option_count - 1)));
+        frame.render_stateful_widget(list, sections[1], &mut state);
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("j/k select · Enter profile · f follow · Enter/o open"),
+            Line::from("↑/↓ PgUp/PgDown scroll post · Esc close"),
+        ])
+        .style(Style::default().fg(p.muted)),
+        sections[2],
     );
     if let (Some(area), Some(preview)) = (image_area, &mut app.native_preview) {
         let block = panel(" Media preview ", false, p);
@@ -1089,7 +1260,7 @@ fn draw_account_add(frame: &mut Frame<'_>, app: &App, p: Palette) {
         (
             "Authorize LazyDon in your browser, then paste the authorization code.",
             "•".repeat(app.account_input.chars().count()),
-            "Ctrl-O: open URL   Enter: add account   Esc: cancel",
+            "Ctrl-O: open   Ctrl-Y: copy URL   Enter: add   Esc: cancel",
             "Code: ",
         )
     };
@@ -1099,7 +1270,7 @@ fn draw_account_add(frame: &mut Frame<'_>, app: &App, p: Palette) {
     );
     if app.account_add_step != 0 {
         frame.render_widget(
-            Paragraph::new(app.auth_url.as_str())
+            Paragraph::new("The browser opens automatically. Use Ctrl-O to reopen, or Ctrl-Y to copy the complete URL.")
                 .style(Style::default().fg(p.accent))
                 .wrap(Wrap { trim: false }),
             sections[1],
@@ -1213,7 +1384,8 @@ fn help_text<'a>() -> Vec<Line<'a>> {
         "?               Toggle this help",
         "q               Quit",
         "",
-        "Details: j/k select, Enter/o opens, arrows scroll.",
+        "Details: j/k select, f follows, Enter opens profile or media.",
+        "Profile: j/k scroll, n loads more posts, Esc goes back.",
         "Compose: Ctrl-S sends, Ctrl-V attaches clipboard image.",
         "Esc keeps the draft; press c to resume it.",
     ]
@@ -1323,7 +1495,8 @@ mod tests {
         app.account_input = "secret-code".into();
         app.auth_url = "https://example.org/oauth/authorize".into();
         let screen = render(&mut app, 120, 36);
-        assert!(screen.contains("https://example.org/oauth/authorize"));
+        assert!(!screen.contains("https://example.org/oauth/authorize"));
+        assert!(screen.contains("Ctrl-Y"));
         assert!(!screen.contains("secret-code"));
         assert!(screen.contains("••••"));
         app.mode = Mode::AccountDeleteConfirm;
@@ -1467,6 +1640,48 @@ mod tests {
         let (_, row, col) = draft_layout("あい\n次", "あい\n".len(), 8);
         assert_eq!((row, col), (1, 0));
     }
+    #[test]
+    fn detail_selection_is_visible_and_readable_in_every_theme() {
+        for theme in [Theme::Dark, Theme::Light, Theme::HighContrast] {
+            let mut app = crate::app::test_app();
+            app.mode = Mode::Detail;
+            app.settings.theme = theme;
+            app.tabs[0].items[0].content = (0..60)
+                .map(|i| format!("Long post line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.tabs[0].items[0].links = (0..15)
+                .map(|i| format!("https://example.test/{i}"))
+                .collect();
+            app.detail_index = app.tabs[0].items[0].detail_account_count() + 14;
+            let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let p = Palette::new(theme);
+            let marker = (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .find(|&(x, y)| x > 5 && buffer[(x, y)].symbol() == "▌")
+                .expect("selected detail option must be visible");
+            // The list highlight covers both the marker and text, and uses a
+            // theme-appropriate text colour rather than user-coloured text.
+            assert_eq!(buffer[(marker.0 + 2, marker.1)].bg, p.selection);
+            assert_eq!(buffer[(marker.0 + 2, marker.1)].fg, p.text);
+            let row: String = (marker.0..buffer.area.width)
+                .map(|x| buffer[(x, marker.1)].symbol())
+                .collect();
+            assert!(row.contains("Link 15:"), "{row}");
+            let screen = render(&mut app, 120, 36);
+            assert!(screen.contains("Long post line 0"));
+            assert!(screen.contains("Enter profile"));
+            assert!(screen.contains("Esc close"));
+            app.detail_scroll = 10;
+            let scrolled = render(&mut app, 120, 36);
+            assert!(scrolled.contains("Long post line 10"));
+            assert!(scrolled.contains("Link 15:"));
+            assert!(scrolled.contains("Esc close"));
+        }
+    }
+
     #[test]
     fn detail_popup_shows_post_metadata_link_preview_and_selectable_urls() {
         let mut app = crate::app::test_app();

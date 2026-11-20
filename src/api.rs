@@ -11,7 +11,8 @@ use std::{
 };
 
 const REDIRECT: &str = "urn:ietf:wg:oauth:2.0:oob";
-const SCOPES: &str = "read write:statuses write:media write:favourites write:bookmarks";
+const SCOPES: &str =
+    "read write:statuses write:media write:favourites write:bookmarks write:follows";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -192,6 +193,20 @@ pub struct Account {
     pub acct: String,
     pub display_name: String,
     pub url: String,
+    pub note: String,
+    pub locked: bool,
+    pub followers_count: u64,
+    pub following_count: u64,
+    pub statuses_count: u64,
+    pub created_at: String,
+    pub fields: Vec<ProfileField>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ProfileField {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -238,6 +253,13 @@ pub struct Notification {
     pub status: Option<Status>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Relationship {
+    pub following: bool,
+    pub requested: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Timeline {
     Home,
@@ -274,6 +296,45 @@ impl Mastodon {
     }
     pub fn verify_credentials(&self) -> Result<Account> {
         decode(self.get("/api/v1/accounts/verify_credentials").send()?)
+    }
+    pub fn status(&self, id: &str) -> Result<Status> {
+        let url = api_resource_url(&self.config.instance, "statuses", id, None)?;
+        decode(
+            self.client
+                .get(url)
+                .bearer_auth(&self.config.access_token)
+                .send()?,
+        )
+    }
+    pub fn account(&self, id: &str) -> Result<Account> {
+        let url = api_resource_url(&self.config.instance, "accounts", id, None)?;
+        decode(
+            self.client
+                .get(url)
+                .bearer_auth(&self.config.access_token)
+                .send()?,
+        )
+    }
+    pub fn account_statuses(&self, id: &str, max_id: Option<&str>) -> Result<Vec<Status>> {
+        let url = api_resource_url(&self.config.instance, "accounts", id, Some("statuses"))?;
+        let mut request = self
+            .client
+            .get(url)
+            .bearer_auth(&self.config.access_token)
+            .query(&[("limit", "40")]);
+        if let Some(max_id) = max_id {
+            request = request.query(&[("max_id", max_id)]);
+        }
+        decode(request.send()?)
+    }
+    pub fn follow(&self, id: &str) -> Result<Relationship> {
+        let url = api_resource_url(&self.config.instance, "accounts", id, Some("follow"))?;
+        decode(
+            self.client
+                .post(url)
+                .bearer_auth(&self.config.access_token)
+                .send()?,
+        )
     }
     pub fn timeline(&self, timeline: Timeline) -> Result<Vec<Status>> {
         let (path, local) = match timeline {
@@ -368,6 +429,28 @@ impl Mastodon {
     }
 }
 
+fn api_resource_url(
+    instance: &str,
+    resource: &str,
+    id: &str,
+    action: Option<&str>,
+) -> Result<reqwest::Url> {
+    if id.is_empty() || matches!(id, "." | "..") {
+        bail!("アカウントまたは投稿 ID が不正です");
+    }
+    let mut url = reqwest::Url::parse(instance)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("サーバー URL が不正です"))?;
+        path.clear().extend(["api", "v1", resource, id]);
+        if let Some(action) = action {
+            path.push(action);
+        }
+    }
+    Ok(url)
+}
+
 fn wait_for_media(
     mut attachment: MediaAttachment,
     timeout: Duration,
@@ -396,6 +479,33 @@ fn wait_for_media(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_and_status_ids_are_single_encoded_path_segments() {
+        let url = api_resource_url(
+            "https://example.com",
+            "accounts",
+            "a/b?# %雪",
+            Some("follow"),
+        )
+        .unwrap();
+        assert_eq!(
+            url.path_segments().unwrap().collect::<Vec<_>>(),
+            [
+                "api",
+                "v1",
+                "accounts",
+                "a%2Fb%3F%23%20%25%E9%9B%AA",
+                "follow"
+            ]
+        );
+        assert_eq!(url.host_str(), Some("example.com"));
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+        for id in ["", ".", ".."] {
+            assert!(api_resource_url("https://example.com", "statuses", id, None).is_err());
+        }
+    }
 
     #[test]
     fn config_uses_legacy_only_when_new_config_is_missing() {

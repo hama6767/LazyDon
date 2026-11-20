@@ -22,6 +22,7 @@ pub enum Mode {
     AddTab,
     Help,
     Detail,
+    Profile,
     Settings,
     AccountManage,
     AccountAdd,
@@ -52,6 +53,8 @@ pub struct ViewItem {
     key: String,
     pub author: String,
     pub acct: String,
+    pub account_id: String,
+    pub reply_to_id: Option<String>,
     pub content: String,
     pub timestamp: String,
     pub context: String,
@@ -63,6 +66,18 @@ pub struct ViewItem {
     pub link_preview: Option<String>,
     favourite: bool,
     boosted: bool,
+}
+pub struct Profile {
+    pub account: Option<Account>,
+    pub account_error: Option<String>,
+    pub posts: Vec<ViewItem>,
+    pub posts_error: Option<String>,
+    pub loading_posts: bool,
+    pub has_more: bool,
+    pub scroll: u16,
+    id: String,
+    next_id: Option<String>,
+    generation: u64,
 }
 pub struct App {
     pub tabs: Vec<Tab>,
@@ -77,6 +92,12 @@ pub struct App {
     pub font_candidate: Option<u8>,
     pub detail_index: usize,
     pub detail_scroll: u16,
+    pub profile: Option<Profile>,
+    profile_generation: u64,
+    pub reply_targets: HashMap<String, Result<Account, String>>,
+    reply_requests: HashSet<String>,
+    pub follow_results: HashMap<String, String>,
+    pub follow_requests: HashSet<String>,
     pub native_preview: Option<media::NativePreview>,
     picker: ratatui_image::picker::Picker,
     pub instance: String,
@@ -117,8 +138,13 @@ enum Message {
     Clipboard(Result<Vec<u8>, String>),
     Posted(Result<(), String>),
     Action(String, bool, bool, Result<Status, String>),
+    ReplyTarget(String, Result<Account, String>),
+    Follow(String, Result<api::Relationship, String>),
+    ProfileAccount(u64, Result<Account, String>),
+    ProfilePosts(u64, Result<Vec<Status>, String>),
     AuthRegistered(u64, Result<api::Authorization, String>),
     AuthVerified(u64, Result<(Config, Account), String>),
+    AuthUrlCopied(u64, Result<(), String>),
     Identity(Result<Account, String>),
 }
 impl Tab {
@@ -136,6 +162,11 @@ impl Tab {
             selected: 0,
             kind,
         }
+    }
+}
+impl ViewItem {
+    pub fn detail_account_count(&self) -> usize {
+        usize::from(!self.account_id.is_empty()) + usize::from(self.reply_to_id.is_some())
     }
 }
 fn view(status: Status, context: String) -> ViewItem {
@@ -213,6 +244,8 @@ fn view(status: Status, context: String) -> ViewItem {
     ViewItem {
         id: status.id,
         key,
+        account_id: status.account.id.clone(),
+        reply_to_id: status.in_reply_to_id.clone().filter(|id| !id.is_empty()),
         author: if status.account.display_name.is_empty() {
             acct.clone()
         } else {
@@ -272,6 +305,8 @@ fn notification(n: Notification) -> ViewItem {
                 n.account.display_name
             },
             acct: n.account.acct,
+            account_id: n.account.id,
+            reply_to_id: None,
             content: label,
             timestamp: n.created_at,
             context: "notification".into(),
@@ -388,6 +423,12 @@ impl App {
                 font_candidate,
                 detail_index: 0,
                 detail_scroll: 0,
+                profile: None,
+                profile_generation: 0,
+                reply_targets: HashMap::new(),
+                reply_requests: HashSet::new(),
+                follow_results: HashMap::new(),
+                follow_requests: HashSet::new(),
                 native_preview: None,
                 picker: ratatui_image::picker::Picker::from_fontsize((10, 20)),
                 instance: config.instance.clone(),
@@ -536,6 +577,119 @@ impl App {
             let _ = tx.send(Message::Action(id, boost, action == "favourite", result));
         });
     }
+    fn load_reply_target(&mut self) {
+        let Some(id) = self.selected().and_then(|item| item.reply_to_id.clone()) else {
+            return;
+        };
+        if matches!(self.reply_targets.get(&id), Some(Ok(_)))
+            || !self.reply_requests.insert(id.clone())
+        {
+            return;
+        }
+        // The direct parent status is authoritative; in_reply_to_account_id can
+        // refer to someone earlier in a self-reply chain.
+        self.reply_targets.remove(&id);
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = Mastodon::new(config)
+                .and_then(|client| client.status(&id))
+                .and_then(|status| {
+                    if status.account.id.is_empty() {
+                        anyhow::bail!("Reply account is unavailable");
+                    }
+                    Ok(status.account)
+                })
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Message::ReplyTarget(id, result));
+        });
+    }
+    fn selected_account_id(&self) -> Option<String> {
+        let item = self.selected()?;
+        let author_count = usize::from(!item.account_id.is_empty());
+        if self.detail_index < author_count {
+            Some(item.account_id.clone())
+        } else if self.detail_index == author_count {
+            item.reply_to_id
+                .as_ref()
+                .and_then(|post_id| self.reply_targets.get(post_id))
+                .and_then(|result| result.as_ref().ok())
+                .map(|account| account.id.clone())
+        } else {
+            None
+        }
+    }
+    fn open_profile(&mut self) {
+        let Some(id) = self.selected_account_id() else {
+            self.status = "Select a loaded account to view its profile.".into();
+            return;
+        };
+        self.profile_generation = self.profile_generation.wrapping_add(1);
+        let generation = self.profile_generation;
+        self.profile = Some(Profile {
+            account: None,
+            account_error: None,
+            posts: vec![],
+            posts_error: None,
+            loading_posts: false,
+            has_more: true,
+            scroll: 0,
+            id: id.clone(),
+            next_id: None,
+            generation,
+        });
+        self.mode = Mode::Profile;
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = Mastodon::new(config)
+                .and_then(|c| c.account(&id))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Message::ProfileAccount(generation, result));
+        });
+        self.load_profile_posts();
+    }
+    fn load_profile_posts(&mut self) {
+        let Some(profile) = self.profile.as_mut() else {
+            return;
+        };
+        if profile.loading_posts || !profile.has_more {
+            return;
+        }
+        profile.loading_posts = true;
+        profile.posts_error = None;
+        let id = profile.id.clone();
+        let max_id = profile.next_id.clone();
+        let generation = profile.generation;
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = Mastodon::new(config)
+                .and_then(|c| c.account_statuses(&id, max_id.as_deref()))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Message::ProfilePosts(generation, result));
+        });
+    }
+    fn follow_selected(&mut self) {
+        let Some(id) = self.selected_account_id() else {
+            self.status = "Select a loaded account to follow.".into();
+            return;
+        };
+        if !self.follow_requests.insert(id.clone()) {
+            self.status = "Follow request is already in progress.".into();
+            return;
+        }
+        self.follow_results.remove(&id);
+        self.status = "Following…".into();
+        let config = self.config.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = Mastodon::new(config)
+                .and_then(|client| client.follow(&id))
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Message::Follow(id, result));
+        });
+    }
     fn handle(&mut self, message: Message) {
         match message {
             Message::Loaded(kind, request_id, Ok(items)) => {
@@ -602,8 +756,12 @@ impl App {
                         self.auth = Some(auth);
                         self.account_add_step = 1;
                         self.account_input.clear();
-                        self.settings_message =
-                            "Authorize in your browser, then paste the code.".into();
+                        self.settings_message = match links::open(&self.auth_url) {
+                            Ok(()) => "Opening browser; paste the authorization code below.".into(),
+                            Err(e) => {
+                                format!("Could not open browser: {e:#}. Use Ctrl-O or Ctrl-Y.")
+                            }
+                        };
                     }
                     Err(e) => self.settings_message = format!("Registration failed: {e}"),
                 }
@@ -622,11 +780,80 @@ impl App {
                     Err(e) => self.settings_message = format!("Authorization failed: {e}"),
                 }
             }
-            Message::AuthRegistered(_, _) | Message::AuthVerified(_, _) => {}
+            Message::AuthUrlCopied(attempt, result)
+                if attempt == self.auth_attempt
+                    && self.mode == Mode::AccountAdd
+                    && self.account_add_step == 1 =>
+            {
+                self.settings_message = match result {
+                    Ok(()) => "Full authorization URL copied.".into(),
+                    Err(e) => format!("Could not copy URL: {e}"),
+                };
+            }
+            Message::AuthRegistered(_, _)
+            | Message::AuthVerified(_, _)
+            | Message::AuthUrlCopied(_, _) => {}
             Message::Identity(Ok(account)) => self
                 .pending_actions
                 .push_back(WorkspaceAction::Upgrade(account)),
             Message::Identity(Err(_)) => {}
+            Message::ReplyTarget(id, result) => {
+                self.reply_requests.remove(&id);
+                self.reply_targets.insert(id, result);
+            }
+            Message::ProfileAccount(generation, result) => {
+                if let Some(profile) = self
+                    .profile
+                    .as_mut()
+                    .filter(|p| p.generation == generation && self.mode == Mode::Profile)
+                {
+                    match result {
+                        Ok(account) => profile.account = Some(account),
+                        Err(error) => profile.account_error = Some(error),
+                    }
+                }
+            }
+            Message::ProfilePosts(generation, result) => {
+                if let Some(profile) = self
+                    .profile
+                    .as_mut()
+                    .filter(|p| p.generation == generation && self.mode == Mode::Profile)
+                {
+                    profile.loading_posts = false;
+                    match result {
+                        Ok(statuses) => {
+                            let next_id = statuses
+                                .last()
+                                .map(|s| s.id.clone())
+                                .filter(|id| !id.is_empty());
+                            profile.has_more = !statuses.is_empty()
+                                && next_id.is_some()
+                                && next_id != profile.next_id;
+                            profile.next_id = next_id;
+                            let mut seen: HashSet<String> =
+                                profile.posts.iter().map(|p| p.key.clone()).collect();
+                            profile.posts.extend(
+                                statuses
+                                    .into_iter()
+                                    .filter(|s| seen.insert(s.id.clone()))
+                                    .map(|s| view(s, String::new())),
+                            );
+                        }
+                        Err(error) => profile.posts_error = Some(error),
+                    }
+                }
+            }
+            Message::Follow(id, result) => {
+                self.follow_requests.remove(&id);
+                let result = match result {
+                    Ok(relationship) if relationship.following => "Following".into(),
+                    Ok(relationship) if relationship.requested => "Follow requested".into(),
+                    Ok(_) => "Follow returned no confirmation".into(),
+                    Err(e) => format!("Follow failed: {e}. If permission is missing, re-add this account in Settings to reauthorize."),
+                };
+                self.status = result.clone();
+                self.follow_results.insert(id, result);
+            }
             Message::Action(id, boost, favourited, result) => {
                 self.pending_interactions.remove(&(id.clone(), boost));
                 match result {
@@ -752,6 +979,7 @@ impl App {
                         self.detail_index = 0;
                         self.detail_scroll = 0;
                         self.mode = Mode::Detail;
+                        self.load_reply_target();
                     }
                 }
                 KeyCode::Char('a') => self.mode = Mode::AddTab,
@@ -945,6 +1173,19 @@ impl App {
                         Ok(()) => "Opening authorization URL…".into(),
                         Err(e) => format!("Could not open browser: {e:#}"),
                     };
+                } else if !self.account_busy
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('y')
+                    && self.account_add_step == 1
+                {
+                    let url = self.auth_url.clone();
+                    let attempt = self.auth_attempt;
+                    let tx = self.tx.clone();
+                    self.settings_message = "Copying authorization URL…".into();
+                    thread::spawn(move || {
+                        let result = links::copy_to_clipboard(&url).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(Message::AuthUrlCopied(attempt, result));
+                    });
                 } else if !self.account_busy && key.code == KeyCode::Enter {
                     if self.account_input.trim().is_empty() {
                         self.settings_message = "Input cannot be empty.".into();
@@ -994,7 +1235,9 @@ impl App {
             Mode::Detail => {
                 let count = self
                     .selected()
-                    .map(|item| item.attachments.len() + item.links.len())
+                    .map(|item| {
+                        item.detail_account_count() + item.attachments.len() + item.links.len()
+                    })
                     .unwrap_or(0);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
@@ -1006,16 +1249,22 @@ impl App {
                     KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                     KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
                     KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+                    KeyCode::Char('f') => self.follow_selected(),
+                    KeyCode::Enter
+                        if self.selected().is_some_and(|item| {
+                            self.detail_index < item.detail_account_count()
+                        }) =>
+                    {
+                        self.open_profile()
+                    }
                     KeyCode::Enter | KeyCode::Char('o') => {
                         let url = self.selected().and_then(|item| {
-                            if self.detail_index < item.attachments.len() {
-                                item.attachments
-                                    .get(self.detail_index)
-                                    .map(|a| a.url.clone())
+                            let index =
+                                self.detail_index.checked_sub(item.detail_account_count())?;
+                            if index < item.attachments.len() {
+                                item.attachments.get(index).map(|a| a.url.clone())
                             } else {
-                                item.links
-                                    .get(self.detail_index - item.attachments.len())
-                                    .cloned()
+                                item.links.get(index - item.attachments.len()).cloned()
                             }
                         });
                         self.status = match url {
@@ -1029,6 +1278,34 @@ impl App {
                     _ => {}
                 }
             }
+            Mode::Profile => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = Mode::Detail;
+                    self.profile = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(p) = &mut self.profile {
+                        p.scroll = p.scroll.saturating_add(1)
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(p) = &mut self.profile {
+                        p.scroll = p.scroll.saturating_sub(1)
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(p) = &mut self.profile {
+                        p.scroll = p.scroll.saturating_add(10)
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(p) = &mut self.profile {
+                        p.scroll = p.scroll.saturating_sub(10)
+                    }
+                }
+                KeyCode::Char('n') => self.load_profile_posts(),
+                _ => {}
+            },
             Mode::Compose => {
                 if key.code == KeyCode::Esc && !self.busy {
                     self.mode = Mode::Normal;
@@ -1240,6 +1517,7 @@ impl Workspace {
                 }
                 if self.sessions[index].app.busy
                     || !self.sessions[index].app.pending_interactions.is_empty()
+                    || !self.sessions[index].app.follow_requests.is_empty()
                 {
                     self.error(
                         source,
@@ -1316,6 +1594,7 @@ impl Workspace {
                     self.sessions[i].app.busy
                         || self.sessions[i].app.account_busy
                         || !self.sessions[i].app.pending_interactions.is_empty()
+                        || !self.sessions[i].app.follow_requests.is_empty()
                         || !self.sessions[i].app.pending_actions.is_empty()
                 }) {
                     self.error(
@@ -1345,6 +1624,7 @@ impl Workspace {
                 if old_index.is_some_and(|i| {
                     self.sessions[i].app.busy
                         || !self.sessions[i].app.pending_interactions.is_empty()
+                        || !self.sessions[i].app.follow_requests.is_empty()
                 }) {
                     self.error(source, "Wait for this account's pending post or clipboard operation before reauthorizing.".into());
                     return false;
@@ -1452,6 +1732,8 @@ impl Workspace {
                         || !self.sessions[source].app.pending_actions.is_empty()
                         || !self.sessions[source].app.pending_interactions.is_empty()
                         || !self.sessions[target].app.pending_interactions.is_empty()
+                        || !self.sessions[source].app.follow_requests.is_empty()
+                        || !self.sessions[target].app.follow_requests.is_empty()
                     {
                         self.error(
                             source,
@@ -1539,10 +1821,19 @@ impl Workspace {
 pub fn run(terminal: &mut ratatui::DefaultTerminal, store: accounts::AccountStore) -> Result<()> {
     let mut workspace = Workspace::new(store)?;
     loop {
-        for session in &mut workspace.sessions {
+        for (index, session) in workspace.sessions.iter_mut().enumerate() {
             for _ in 0..100 {
                 match session.rx.try_recv() {
-                    Ok(msg) => session.app.handle(msg),
+                    Ok(msg) => {
+                        let was_composing = session.app.mode == Mode::Compose;
+                        session.app.handle(msg);
+                        if index == workspace.active
+                            && was_composing
+                            && session.app.mode != Mode::Compose
+                        {
+                            crate::ime::request_direct_input();
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -1574,8 +1865,15 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, store: accounts::AccountStor
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
+                    let was_composing = workspace.sessions[active].app.mode == Mode::Compose;
                     if workspace.sessions[active].app.key(key) {
                         break;
+                    }
+                    if !was_composing && workspace.sessions[active].app.mode == Mode::Compose {
+                        crate::ime::cancel_pending();
+                    } else if was_composing && workspace.sessions[active].app.mode != Mode::Compose
+                    {
+                        crate::ime::request_direct_input();
                     }
                     let preferences = workspace.sessions[active].app.settings.clone();
                     for session in &mut workspace.sessions {
@@ -1626,6 +1924,8 @@ pub(crate) fn test_app() -> App {
         key: "1".into(),
         author: "Alice".into(),
         acct: "alice@example.com".into(),
+        account_id: "1".into(),
+        reply_to_id: None,
         content: "Hello from Alice".into(),
         timestamp: "2026-01-01".into(),
         context: String::new(),
@@ -1645,6 +1945,186 @@ pub(crate) fn test_app() -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn profile_fixture(generation: u64) -> Profile {
+        Profile {
+            account: None,
+            account_error: None,
+            posts: vec![],
+            posts_error: None,
+            loading_posts: true,
+            has_more: true,
+            scroll: 0,
+            id: "42".into(),
+            next_id: None,
+            generation,
+        }
+    }
+
+    #[test]
+    fn profile_responses_are_scoped_to_current_view_and_account_session() {
+        let mut first = test_app();
+        let mut second = test_app();
+        first.mode = Mode::Profile;
+        second.mode = Mode::Profile;
+        first.profile = Some(profile_fixture(2));
+        second.profile = Some(profile_fixture(2));
+        first.handle(Message::ProfileAccount(
+            1,
+            Ok(Account {
+                acct: "stale".into(),
+                ..Default::default()
+            }),
+        ));
+        assert!(first.profile.as_ref().unwrap().account.is_none());
+        first.handle(Message::ProfileAccount(
+            2,
+            Ok(Account {
+                acct: "alice".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(
+            first
+                .profile
+                .as_ref()
+                .unwrap()
+                .account
+                .as_ref()
+                .unwrap()
+                .acct,
+            "alice"
+        );
+        assert!(second.profile.as_ref().unwrap().account.is_none());
+        first.mode = Mode::Detail;
+        first.handle(Message::ProfilePosts(
+            2,
+            Ok(vec![Status {
+                id: "late".into(),
+                ..Default::default()
+            }]),
+        ));
+        assert!(first.profile.as_ref().unwrap().posts.is_empty());
+    }
+
+    #[test]
+    fn profile_pages_deduplicate_and_handle_short_pages_failures_and_last_page() {
+        let mut app = test_app();
+        app.mode = Mode::Profile;
+        app.profile = Some(profile_fixture(7));
+        let post = |id: &str| Status {
+            id: id.into(),
+            content: format!("<p>{id}</p>"),
+            ..Default::default()
+        };
+        app.handle(Message::ProfilePosts(7, Ok(vec![post("3"), post("2")])));
+        let profile = app.profile.as_ref().unwrap();
+        assert_eq!(profile.posts.len(), 2);
+        assert!(profile.has_more); // Servers may return fewer than the requested limit.
+        assert_eq!(profile.next_id.as_deref(), Some("2"));
+        app.handle(Message::ProfilePosts(7, Err("offline".into())));
+        assert_eq!(
+            app.profile.as_ref().unwrap().posts_error.as_deref(),
+            Some("offline")
+        );
+        assert!(app.profile.as_ref().unwrap().has_more);
+        app.handle(Message::ProfilePosts(7, Ok(vec![post("2"), post("1")])));
+        assert_eq!(app.profile.as_ref().unwrap().posts.len(), 3);
+        app.handle(Message::ProfilePosts(7, Ok(vec![post("1")])));
+        let profile = app.profile.as_ref().unwrap();
+        assert_eq!(profile.posts.len(), 3);
+        assert!(!profile.has_more); // A repeated cursor cannot loop indefinitely.
+    }
+
+    #[test]
+    fn profile_closes_back_to_post_details() {
+        let mut app = test_app();
+        app.mode = Mode::Profile;
+        app.profile = Some(profile_fixture(1));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.mode == Mode::Detail);
+        assert!(app.profile.is_none());
+    }
+
+    #[test]
+    fn profile_renders_metadata_and_bounds_scroll_at_end() {
+        let mut app = test_app();
+        app.mode = Mode::Profile;
+        let mut profile = profile_fixture(1);
+        profile.loading_posts = false;
+        profile.account = Some(Account {
+            acct: "alice@example.com".into(),
+            display_name: "Alice".into(),
+            note: "<p>Artist &amp; reader</p>".into(),
+            followers_count: 12,
+            created_at: "2020-01-01".into(),
+            fields: vec![api::ProfileField {
+                name: "Website".into(),
+                value: "<a href='https://example.com'>Example</a>".into(),
+            }],
+            ..Default::default()
+        });
+        profile.posts = (0..20)
+            .map(|i| {
+                view(
+                    Status {
+                        id: i.to_string(),
+                        content: if i == 1 {
+                            format!("<p>{}</p>", "abcdefghijklmnopqrstuv ".repeat(80))
+                        } else {
+                            format!("<p>Post number {i}</p>")
+                        },
+                        ..Default::default()
+                    },
+                    String::new(),
+                )
+            })
+            .collect();
+        app.profile = Some(profile);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let contents = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(contents.contains("Artist & reader"));
+        assert!(contents.contains("Website: Example"));
+        assert!(contents.contains("12 followers"));
+        assert!(contents.contains("Joined: 2020-01-01"));
+        assert!(contents.contains("n load 40 more"));
+        app.profile.as_mut().unwrap().scroll = u16::MAX;
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        assert!(app.profile.as_ref().unwrap().scroll < u16::MAX);
+        let contents = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(contents.contains("Post number 19"));
+    }
+    #[test]
+    fn copied_url_result_is_ignored_after_authentication_is_cancelled() {
+        let mut app = test_app();
+        app.mode = Mode::AccountAdd;
+        app.account_add_step = 1;
+        app.auth_attempt = 3;
+        app.handle(Message::AuthUrlCopied(3, Ok(())));
+        assert_eq!(app.settings_message, "Full authorization URL copied.");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.settings_message = "new screen".into();
+        app.handle(Message::AuthUrlCopied(3, Err("old result".into())));
+        assert_eq!(app.settings_message, "new screen");
+    }
+
     #[test]
     fn default_tabs_and_draft_retention() {
         let mut app = test_app();
@@ -1711,6 +2191,83 @@ mod tests {
         assert!(app.mode == Mode::Detail);
         app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.detail_index, 1);
+    }
+    #[test]
+    fn detail_targets_the_original_author_and_direct_reply() {
+        let original = Status {
+            id: "123".into(),
+            in_reply_to_id: Some("999".into()),
+            account: Account {
+                id: "11".into(),
+                acct: "alice".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let item = view(
+            Status {
+                id: "456".into(),
+                account: Account {
+                    id: "44".into(),
+                    acct: "booster".into(),
+                    ..Default::default()
+                },
+                reblog: Some(Box::new(original)),
+                ..Default::default()
+            },
+            String::new(),
+        );
+        assert_eq!(item.account_id, "11");
+        assert_eq!(item.reply_to_id.as_deref(), Some("999"));
+        assert_eq!(item.detail_account_count(), 2);
+        let mut app = test_app();
+        app.tabs[0].items = vec![item];
+        app.mode = Mode::Detail;
+        app.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.detail_index, 1);
+        app.handle(Message::ReplyTarget(
+            "999".into(),
+            Ok(Account {
+                id: "22".into(),
+                acct: "bob".into(),
+                ..Default::default()
+            }),
+        ));
+        app.handle(Message::ReplyTarget(
+            "other".into(),
+            Ok(Account {
+                id: "33".into(),
+                acct: "mallory".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(app.reply_targets["999"].as_ref().unwrap().id, "22");
+        assert_eq!(app.reply_targets["other"].as_ref().unwrap().id, "33");
+    }
+    #[test]
+    fn follow_result_distinguishes_follow_and_request_and_failure() {
+        let mut app = test_app();
+        app.follow_requests.insert("11".into());
+        app.handle(Message::Follow(
+            "11".into(),
+            Ok(api::Relationship {
+                following: true,
+                requested: false,
+            }),
+        ));
+        assert!(!app.follow_requests.contains("11"));
+        assert_eq!(app.follow_results["11"], "Following");
+        app.handle(Message::Follow(
+            "22".into(),
+            Ok(api::Relationship {
+                following: false,
+                requested: true,
+            }),
+        ));
+        assert_eq!(app.follow_results["22"], "Follow requested");
+        app.handle(Message::Follow("33".into(), Err("403".into())));
+        assert!(app.follow_results["33"].contains("reauthorize"));
+        assert_eq!(app.follow_results["11"], "Following");
     }
     #[test]
     fn boost_displays_original_author_and_id() {
