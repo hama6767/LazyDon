@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod media;
+mod stream;
 mod ui;
 
 use anyhow::{Context, Result};

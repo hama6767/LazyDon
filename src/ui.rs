@@ -39,23 +39,32 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     );
     frame.render_widget(header, rows[0]);
 
-    // Stack the panels on narrow screens so that details remain accessible.
-    if rows[1].width >= 80 {
+    // Keep notifications visible while preserving room for the selected post.
+    // On narrower terminals the same three panels stack vertically.
+    if rows[1].width >= 105 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(47), Constraint::Percentage(53)])
+            .constraints([
+                Constraint::Percentage(42),
+                Constraint::Percentage(30),
+                Constraint::Percentage(28),
+            ])
             .split(rows[1]);
         draw_timeline(frame, app, columns[0]);
         draw_detail(frame, app, columns[1]);
-    } else if rows[1].height >= 16 {
+        draw_notifications(frame, app, columns[2]);
+    } else {
         let panels = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([
+                Constraint::Percentage(40),
+                Constraint::Percentage(32),
+                Constraint::Percentage(28),
+            ])
             .split(rows[1]);
         draw_timeline(frame, app, panels[0]);
         draw_detail(frame, app, panels[1]);
-    } else {
-        draw_timeline(frame, app, rows[1]);
+        draw_notifications(frame, app, panels[2]);
     }
 
     let footer = Paragraph::new(vec![
@@ -84,24 +93,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             58,
             30,
         ),
-        Mode::Compose => {
-            let mut lines = vec![
-                Line::from("Write a post. Ctrl-S: send · Esc: keep draft"),
-                Line::from("Ctrl-V: attach image from clipboard"),
-                Line::from(Span::styled(
-                    app.status.as_str(),
-                    Style::default().fg(Color::Yellow),
-                )),
-                Line::from(""),
-            ];
-            lines.extend(app.input.split('\n').map(Line::from));
-            draw_popup(frame, " New post ", lines, 80, 65);
-        }
+        Mode::Compose => draw_compose(frame, app),
     }
 }
 
 fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(tab) = app.tabs.get(app.active) else {
+    // Notifications have their own persistent panel. When it has focus, keep
+    // the Home timeline alongside it instead of showing the same list twice.
+    let timeline_index = app
+        .tabs
+        .get(app.active)
+        .filter(|tab| tab.title != "Notifications")
+        .map(|_| app.active)
+        .or_else(|| app.tabs.iter().position(|tab| tab.title == "Home"));
+    let Some(tab) = timeline_index.and_then(|index| app.tabs.get(index)) else {
         frame.render_widget(
             Paragraph::new("No timelines").block(panel(" Timelines ", true)),
             area,
@@ -137,10 +142,11 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let items: Vec<ListItem<'_>> = tab.items.iter().map(item_row).collect();
     let title = format!(" {} · {} ", tab.title, tab.items.len());
+    let timeline_focused = timeline_index == Some(app.active);
     let list = List::new(items)
-        .block(panel(&title, true))
+        .block(panel(&title, timeline_focused))
         .highlight_style(Style::default().bg(Color::Rgb(34, 48, 57)))
-        .highlight_symbol("▌");
+        .highlight_symbol(if timeline_focused { "▌" } else { " " });
     let mut state = ListState::default();
     if !tab.items.is_empty() {
         state.select(Some(tab.selected.min(tab.items.len() - 1)));
@@ -155,6 +161,74 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
             inner,
         );
     }
+}
+
+fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some((index, tab)) = app
+        .tabs
+        .iter()
+        .enumerate()
+        .find(|(_, tab)| tab.title == "Notifications")
+    else {
+        frame.render_widget(
+            Paragraph::new("Notifications unavailable").block(panel(" Notifications ", false)),
+            area,
+        );
+        return;
+    };
+    let focused = index == app.active;
+    let title = format!(" Notifications · {} ", tab.items.len());
+    let list = List::new(tab.items.iter().map(notification_row).collect::<Vec<_>>())
+        .block(panel(&title, focused))
+        .highlight_style(Style::default().bg(Color::Rgb(34, 48, 57)))
+        .highlight_symbol(if focused { "▌" } else { " " });
+    let mut state = ListState::default();
+    if !tab.items.is_empty() {
+        state.select(Some(tab.selected.min(tab.items.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+    if tab.items.is_empty() {
+        let inner = panel("", focused).inner(area);
+        frame.render_widget(
+            Paragraph::new("No notifications yet.")
+                .style(Style::default().fg(Color::DarkGray))
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+    }
+}
+
+fn notification_row(item: &ViewItem) -> ListItem<'_> {
+    let event = if item.context == "notification" {
+        item.content.as_str()
+    } else {
+        item.context.split(" ♥").next().unwrap_or(&item.context)
+    };
+    let body = truncate(
+        &item
+            .content
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" "),
+        105,
+    );
+    ListItem::new(vec![
+        Line::from(Span::styled(
+            event.to_owned(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(body, Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::styled(
+            format!("  └─ @{} · {}", item.acct, item.timestamp),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
 }
 
 fn item_row(item: &ViewItem) -> ListItem<'_> {
@@ -191,8 +265,8 @@ fn item_row(item: &ViewItem) -> ListItem<'_> {
             ),
         ]),
         Line::from(vec![
-            Span::styled("  ├─ ", Style::default().fg(Color::DarkGray)),
-            Span::raw(body),
+            Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(body, Style::default().fg(Color::White)),
         ]),
         Line::from(Span::styled(
             format!("  └─ {}{}{}", item.timestamp, context, media),
@@ -234,27 +308,127 @@ fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )),
         Line::from(""),
     ];
-    lines.extend(item.content.lines().map(|line| Line::from(line.to_owned())));
-    if !item.media.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("└─ Media ({})", item.media.len()),
-            Style::default().fg(Color::Cyan),
-        )));
+    lines.extend(item.content.lines().map(|line| {
+        Line::from(Span::styled(
+            line.to_owned(),
+            Style::default().fg(Color::White),
+        ))
+    }));
+    let block = panel(" Post ", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if item.media.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            inner,
+        );
+    } else {
+        // Draw image rows in a separate, non-wrapping paragraph: wrapping a
+        // terminal image breaks its geometry when the pane is narrow.
+        let width = inner.width.max(1) as usize;
+        let text_height: usize = lines
+            .iter()
+            .map(|line| (line.width().max(1) + width - 1) / width)
+            .sum();
+        let body_height = text_height.min((inner.height as usize / 2).max(1)) as u16;
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(body_height),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            sections[0],
+        );
+        frame.render_widget(
+            Paragraph::new(format!("└─ Media ({})", item.media.len()))
+                .style(Style::default().fg(Color::Cyan)),
+            sections[1],
+        );
         if app.preview.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "   Loading preview…",
-                Style::default().fg(Color::DarkGray),
-            )));
+            frame.render_widget(
+                Paragraph::new("Loading preview…").style(Style::default().fg(Color::DarkGray)),
+                sections[2],
+            );
         } else {
-            lines.extend(app.preview.iter().map(|line| Line::from(line.as_str())));
+            frame.render_widget(Paragraph::new(app.preview.clone()), sections[2]);
         }
     }
+}
+
+fn draw_compose(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_rect(80, 75, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(" New post ", true);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(panel(" Post ", false))
-            .wrap(Wrap { trim: false }),
-        area,
+        Paragraph::new(Line::from(vec![
+            Span::styled("Posting as ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&app.account, Style::default().fg(Color::Cyan)),
+        ])),
+        sections[0],
+    );
+    let body = if app.input.is_empty() {
+        Text::from(Span::styled(
+            "Write your post here…",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Text::raw(app.input.as_str())
+    };
+    // Keep the most recently typed text visible when a long draft wraps.
+    let width = sections[1].width.saturating_sub(2).max(1) as usize;
+    let line_count: usize = app
+        .input
+        .split('\n')
+        .map(|line| (Line::from(line).width().max(1) + width - 1) / width)
+        .sum();
+    let visible = sections[1].height.saturating_sub(2) as usize;
+    let scroll = line_count.saturating_sub(visible).min(u16::MAX as usize) as u16;
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(panel(" Body · editing ", true))
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(25, 31, 39)))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        sections[1],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Attachments  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{} / 4 images", app.attachment_count())),
+                Span::styled(
+                    "    ·    Characters  ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(app.input.chars().count().to_string()),
+            ]),
+            Line::from(Span::styled(
+                &app.status,
+                Style::default().fg(Color::Yellow),
+            )),
+        ]),
+        sections[2],
+    );
+    frame.render_widget(
+        Paragraph::new("Ctrl-S: send  ·  Ctrl-V: attach image  ·  Esc: keep draft")
+            .style(Style::default().fg(Color::Cyan))
+            .wrap(Wrap { trim: true }),
+        sections[3],
     );
 }
 
@@ -376,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_terminal_stacks_timeline_and_post_detail() {
+    fn narrow_terminal_stacks_timeline_detail_and_notifications() {
         let app = crate::app::test_app();
         let screen = render(&app, 60, 30);
         assert!(screen.contains("Home"));
@@ -386,12 +560,32 @@ mod tests {
     }
 
     #[test]
+    fn notifications_stay_visible_and_can_be_selected() {
+        let mut app = crate::app::test_app();
+        let mut notification = app.tabs[0].items[0].clone();
+        notification.author = "Bob".into();
+        notification.acct = "bob@example.com".into();
+        notification.content = "New mention".into();
+        app.tabs[1].items.push(notification);
+        let screen = render(&app, 120, 36);
+        assert!(screen.contains("Hello from Alice"));
+        assert!(screen.contains("New mention"));
+        app.active = 1;
+        let screen = render(&app, 120, 36);
+        assert!(screen.contains("Hello from Alice"));
+        assert!(screen.matches("New mention").count() >= 2);
+    }
+
+    #[test]
     fn compose_overlay_shows_multiline_draft_and_retention_hint() {
         let mut app = crate::app::test_app();
         app.mode = Mode::Compose;
         app.input = "First line\nSecond line".into();
         let screen = render(&app, 100, 36);
         assert!(screen.contains("New post"));
+        assert!(screen.contains("Body · editing"));
+        assert!(screen.contains("Attachments"));
+        assert!(screen.contains("0 / 4 images"));
         assert!(screen.contains("First line"));
         assert!(screen.contains("Second line"));
         assert!(screen.contains("Esc: keep draft"));

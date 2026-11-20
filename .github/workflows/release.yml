@@ -1,0 +1,78 @@
+name: Attach latest main build to release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  attach-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      # Resolve the main branch at release time, not the release tag. If a build
+      # is still running, wait for it; if artifacts expired, trigger a new build.
+      - name: Find a successful build for latest main
+        id: build
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let lastSha = '';
+            let dispatchedFor = '';
+            let dispatchedAt = 0;
+            for (let attempt = 0; attempt < 120; attempt++) {
+              const branch = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+              const sha = branch.data.commit.sha;
+              if (sha !== lastSha) {
+                core.info(`Current main: ${sha}`);
+                lastSha = sha;
+              }
+              const result = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: 'linux.yml', branch: 'main', head_sha: sha, per_page: 30
+              });
+              const runs = result.data.workflow_runs.filter(run => run.head_sha === sha);
+              for (const run of runs.filter(run => run.status === 'completed' && run.conclusion === 'success')) {
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
+                if (artifacts.data.artifacts.some(a => a.name === 'lazydon-linux-x86_64' && !a.expired)) {
+                  core.setOutput('run_id', String(run.id));
+                  core.setOutput('sha', sha);
+                  return;
+                }
+              }
+              const pending = runs.some(run => run.status !== 'completed');
+              const dispatchedRuns = runs.filter(run => Date.parse(run.created_at) >= dispatchedAt - 2000);
+              if (!pending && dispatchedFor === sha && dispatchedRuns.some(run => run.status === 'completed' && run.conclusion && run.conclusion !== 'success')) {
+                throw new Error(`Linux build for main ${sha} failed. Fix or rerun the build before publishing.`);
+              }
+              if (!pending && dispatchedFor !== sha) {
+                core.info(`No usable artifact for ${sha}; dispatching a main build.`);
+                dispatchedAt = Date.now();
+                await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: 'linux.yml', ref: 'main' });
+                dispatchedFor = sha;
+              }
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+            throw new Error('Timed out waiting for a successful Linux build of main.');
+      - name: Download main build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lazydon-linux-x86_64
+          path: dist
+          run-id: ${{ steps.build.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Attach artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          BUILD_SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "Attaching Linux build from main commit $BUILD_SHA"
+          cd dist
+          sha256sum --check lazydon-linux-x86_64.tar.gz.sha256
+          gh release upload "$RELEASE_TAG" lazydon-linux-x86_64.tar.gz lazydon-linux-x86_64.tar.gz.sha256 --clobber
