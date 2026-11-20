@@ -56,4 +56,4 @@ cargo build --release
 
 ## Linux のビルドと Release
 
-GitHub Actions は `main` への push と pull request ごとに Linux x86_64（Ubuntu 22.04）用のテストとリリースビルドを実行し、アーカイブと SHA-256 ファイルを成果物に保存します。GitHub Release を公開すると、公開時点の `main` の最新コミットに対応する成功済み Linux ビルドを添付します。ビルドが実行中なら完了を待ち、成果物が期限切れの場合は `main` のビルドを再実行します。Release のタグが指すコミットとは異なる場合があるため、同梱の `BUILD.txt` でソースのコミットを確認できます。
+GitHub Actions は `main` への push と pull request ごとに Linux x86_64（Ubuntu 22.04）用のテストとリリースビルドを実行し、アーカイブと SHA-256 ファイルを成果物に保存します。GitHub Release を公開すると、公開時点の `main` の最新コミットに対応する成功済み Linux ビルドを添付します。ビルドが実行中なら完了を待ち、成果物が期限切れの場合は `main` のビルドを再実行します。Release のタグが指すコミットとは異なる場合があるため、同梱の `BUILD.txt` でソースのコミットを確認できます。GitHub はタグ側のワークフロー定義を使うため、Release のタグはこのワークフローが含まれるコミット以降に作成してください。
