@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/package
-          cp target/release/lazydon README.md LICENSE dist/package/
+          cp target/release/lazydon README.md README.en.md LICENSE dist/package/
           printf 'Source commit: %s\n' "$GITHUB_SHA" > dist/package/BUILD.txt
           tar -C dist/package -czf dist/lazydon-linux-x86_64.tar.gz .
           (cd dist && sha256sum lazydon-linux-x86_64.tar.gz > lazydon-linux-x86_64.tar.gz.sha256)

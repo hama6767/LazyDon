@@ -1,8 +1,12 @@
 # LazyDon
 
+日本語 | [English](README.en.md)
+
 Vim 風のキー操作で使える Mastodon ターミナルクライアントです。ホームと通知を同時に表示でき、ローカル／連合タイムラインのタブ追加、ユーザーごとの色分け表示、CPU・RAM モニターに対応しています。
 
-![LazyDon の画面プレビュー](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/preview.png)
+![LazyDon の画面を切り替える操作デモ](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/demo.gif)
+
+[静止画プレビュー](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/preview.png)
 
 ## 動作環境
 
