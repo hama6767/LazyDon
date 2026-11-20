@@ -11,7 +11,15 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,22 +29,27 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test
         run: cargo test --locked
+      - name: Test installer
+        run: python3 -m unittest discover -s tests -v
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Package Linux x86_64 build
+      - name: Package Linux ${{ matrix.arch }} build
         shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
+          test "$(uname -m)" = "$ARCH"
           mkdir -p dist/package
-          cp target/release/lazydon README.md README.en.md LICENSE dist/package/
+          cp target/release/lazydon README.md README.ja.md LICENSE dist/package/
           printf 'Source commit: %s\n' "$GITHUB_SHA" > dist/package/BUILD.txt
-          tar -C dist/package -czf dist/lazydon-linux-x86_64.tar.gz .
-          (cd dist && sha256sum lazydon-linux-x86_64.tar.gz > lazydon-linux-x86_64.tar.gz.sha256)
+          tar -C dist/package -czf "dist/lazydon-linux-$ARCH.tar.gz" .
+          (cd dist && sha256sum "lazydon-linux-$ARCH.tar.gz" > "lazydon-linux-$ARCH.tar.gz.sha256")
       - uses: actions/upload-artifact@v4
         with:
-          name: lazydon-linux-x86_64
+          name: lazydon-linux-${{ matrix.arch }}
           path: |
-            dist/lazydon-linux-x86_64.tar.gz
-            dist/lazydon-linux-x86_64.tar.gz.sha256
+            dist/lazydon-linux-${{ matrix.arch }}.tar.gz
+            dist/lazydon-linux-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 90

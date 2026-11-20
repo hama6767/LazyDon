@@ -1,24 +1,25 @@
 # LazyDon
 
-日本語 | [English](README.en.md)
+English | [日本語](README.ja.md)
 
-Vim 風のキー操作で使える Mastodon ターミナルクライアントです。ホームと通知を同時に表示でき、ローカル／連合タイムラインのタブ追加、ユーザーごとの色分け表示、CPU・RAM モニターに対応しています。
+LazyDon is a Mastodon terminal client with Vim-style keybindings. View your home timeline and notifications side by side, add local and federated timeline tabs, identify users by color, and monitor CPU and RAM usage on Linux.
 
-![LazyDon の画面を切り替える操作デモ](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/demo.gif)
+![LazyDon demo switching between screens](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/demo.gif)
 
-[静止画プレビュー](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/preview.png)
+[Still preview](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/preview.png)
 
-## 動作環境
+## Requirements
 
-- **OS:** Linux x86_64（GitHub Release 配布版）
-- **アカウント:** HTTPS 接続および OOB 認証（コード貼り付け）に対応した Mastodon サーバー
-- **画像表示:** Kitty / iTerm2 / Sixel を自動検出（非対応端末・tmux・screen では半角ブロック表示。`LAZYDON_IMAGE_PROTOCOL` で `kitty` / `iterm2` / `sixel` / `halfblocks` を指定可能）
-- **外部アプリ起動:** `xdg-open`（認証ページ・元画像・動画・リンクを開く場合）
-- **画像貼り付け（任意）:** `wl-paste`（Wayland）または `xclip`（X11）
+- **OS:** Linux x86_64 or ARM64, or macOS on Apple Silicon (GitHub Release builds)
+- **Account:** A Mastodon server that supports HTTPS and out-of-band (OOB) authorization using a pasted code
+- **Image display:** Kitty, iTerm2, and Sixel are detected automatically. Unsupported terminals, tmux, and screen use half-block rendering. Set `LAZYDON_IMAGE_PROTOCOL` to `kitty`, `iterm2`, `sixel`, or `halfblocks` to choose a protocol.
+- **Opening external applications:** `xdg-open` on Linux or `open` on macOS (for authorization pages, original images, videos, and links)
+- **Pasting images (optional):** `wl-paste` (Wayland) or `xclip` (X11). Clipboard image attachments are not yet available on macOS.
+- **System monitor:** CPU and RAM usage require Linux; on macOS these values are shown as unavailable.
 
-## インストールと起動
+## Installation and launch
 
-`curl`、`tar`、`sha256sum` などを使用し、チェックサムを検証して `~/.local/bin/lazydon` にインストールします（保存先は `LAZYDON_INSTALL_DIR` で変更可能）。
+The installer selects the appropriate release for your platform, verifies its checksum with `sha256sum` or `shasum`, and installs LazyDon to `~/.local/bin/lazydon`. Set `LAZYDON_INSTALL_DIR` to choose another destination.
 
 ```sh
 curl -fsSLo install-lazydon.sh https://raw.githubusercontent.com/hama6767/LazyDon/main/install.sh
@@ -27,88 +28,88 @@ export PATH="$HOME/.local/bin:$PATH"
 lazydon
 ```
 
-永続的にパスを通す場合は、`~/.profile` などに `export PATH="$HOME/.local/bin:$PATH"` を追記してください。
+To add the directory to your PATH permanently, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.profile` or a similar shell configuration file.
 
-### 手動インストール
+### Manual installation
 
-[Releases](https://github.com/hama6767/LazyDon/releases) から `lazydon-linux-x86_64.tar.gz` と `.sha256` を同じディレクトリにダウンロードして実行します。
+Download the archive and its `.sha256` file for your platform from [Releases](https://github.com/hama6767/LazyDon/releases): `lazydon-linux-x86_64.tar.gz`, `lazydon-linux-aarch64.tar.gz`, or `lazydon-macos-aarch64.tar.gz`. For example, on Apple Silicon macOS:
 
 ```sh
-sha256sum -c lazydon-linux-x86_64.tar.gz.sha256
-tar -xzf lazydon-linux-x86_64.tar.gz
+shasum -a 256 -c lazydon-macos-aarch64.tar.gz.sha256
+tar -xzf lazydon-macos-aarch64.tar.gz
 ./lazydon
 ```
 
-## ログインとアカウント管理
+## Login and account management
 
-初回起動時にサーバー名を入力し、自動で開く認証ページで取得したコードを貼り付けます。ブラウザーが開かない場合は `:open` で開き直すか、`:copy` で URL をコピーできます。`:show` で完全な URL の表示もできますが、画面上では折り返される場合があります。
+On first launch, enter your server name and paste the code from the authorization page that opens automatically. If your browser does not open, use `:open` to try again or `:copy` to copy the URL. You can also use `:show` to display the complete URL, although it may wrap on screen.
 
-複数アカウントは `s` → `Accounts` から管理できます。追加時は認証ページが自動で開き、`Ctrl-O` で開き直すか、`Ctrl-Y` で URL をコピーできます。URL のコピーには `wl-copy` または `xclip` が必要です。
+Manage multiple accounts under `s` → `Accounts`. When adding an account, the authorization page opens automatically; use `Ctrl-O` to reopen it or `Ctrl-Y` to copy the URL. Copying a URL requires `wl-copy` or `xclip` on Linux, or `pbcopy` on macOS.
 
-- `a`: アカウントを追加
-- `j` / `k` → `Enter`: アカウントを切り替え
-- `d` → `y`: アカウントを削除
+- `a`: Add an account
+- `j` / `k` → `Enter`: Switch accounts
+- `d` → `y`: Remove an account
 
-以前のバージョンで認証したアカウントでフォローするには、同じアカウントを追加して再認証してください。認証情報は `$XDG_CONFIG_HOME/lazydon/accounts.json`（既定: `~/.config/lazydon/accounts.json`）に保存されます。削除はローカルの認証情報に対して行われ、サーバー側の認可は残ります。
+To follow users with an account authorized in an earlier version, add the same account and authorize it again. Credentials are stored in `$XDG_CONFIG_HOME/lazydon/accounts.json` (default: `~/.config/lazydon/accounts.json`). Removing an account deletes its local credentials; the server-side authorization remains.
 
-## キー操作
+## Keybindings
 
-### 基本操作
+### General
 
-| キー | 操作 |
+| Key | Action |
 | --- | --- |
-| `[` / `]`、`gT` / `gt` | 前 / 次のアカウントへ切り替え |
-| `j` / `k`、上下キー | 投稿を選択 |
-| `g` / `G` | 先頭 / 末尾へ移動 |
-| `h` / `l`、左右キー | タイムラインと通知を切り替え |
-| `a` → `l` / `f` | ローカル / 連合タブを追加（既存なら移動） |
-| `r` | 現在のタブを再取得 |
-| `R` | 選択した投稿に返信 |
-| `f` / `b` | お気に入り / ブースト |
-| `Enter` | 投稿の詳細を開く |
-| `c` | 投稿画面を開く |
-| `s` | 設定を開く |
-| `?` | ヘルプ |
-| `q` | 終了 |
+| `[` / `]`, `gT` / `gt` | Switch to the previous / next account |
+| `j` / `k`, Up / Down | Select a post |
+| `g` / `G` | Move to the beginning / end |
+| `h` / `l`, Left / Right | Switch between the timeline and notifications |
+| `a` → `l` / `f` | Add a local / federated tab, or switch to it if already open |
+| `r` | Refresh the current tab |
+| `R` | Reply to the selected post |
+| `f` / `b` | Favorite / boost |
+| `Enter` | Open post details |
+| `c` | Open the composer |
+| `s` | Open settings |
+| `?` | Show help |
+| `q` | Quit |
 
-### 投稿画面
+### Composer
 
-| キー | 操作 |
+| Key | Action |
 | --- | --- |
-| `Ctrl-V` | クリップボードの PNG 画像を添付（最大 4 枚） |
-| `Ctrl-S` | 送信 |
-| `Esc` | 下書きを保持して閉じる |
-| `Ctrl-D` を 2 回 | 下書きと添付を破棄 |
+| `Ctrl-V` | Attach a PNG image from the clipboard on Linux (up to 4 images) |
+| `Ctrl-S` | Send |
+| `Esc` | Close and keep the draft |
+| `Ctrl-D` twice | Discard the draft and attachments |
 
-Fcitx 5 / Fcitx では、画面を閉じたときや投稿に成功したときに英数入力への切り替えを試みます（`fcitx5-remote` / `fcitx-remote`、Fcitx 5 では `dbus-send` が必要）。IBus や SSH 接続先から操作できない IME では、通常の入力切り替えキーを使ってください。
+With Fcitx 5 or Fcitx, LazyDon attempts to switch to alphanumeric input when the composer closes or a post is sent successfully. This requires `fcitx5-remote` or `fcitx-remote`, and `dbus-send` for Fcitx 5. For IBus or an IME that cannot be controlled from an SSH session, use your usual input-switching key.
 
-返信では宛先を本文に補完し、返信元とアカウントの既定設定のうち狭い公開範囲を選びます。既定設定を取得できない場合は `direct` になります。送信前に宛先と公開範囲を確認できます。
+For replies, LazyDon fills in the recipients and chooses the more restrictive visibility of the original post and the account's default. If it cannot retrieve the default, it uses `direct`. You can check the recipients and visibility before sending.
 
-### 詳細画面
+### Post details
 
-| キー | 操作 |
+| Key | Action |
 | --- | --- |
-| `j` / `k` | 投稿者・返信先・画像・動画・URL を選択 |
-| `f` | 選択した投稿者または返信先をフォロー（鍵付きの場合は申請） |
-| `R` | 投稿に返信 |
-| `t` | 返信ツリーを開く |
-| `r` | 返信ツリーを再取得 |
-| `c` | 保持した下書きを再開 |
-| `Enter` | 選択したアカウントのプロフィールを表示、または画像・動画・URL を外部アプリで開く |
-| `o` | 選択した画像・動画・URL を外部アプリで開く |
-| `↑` / `↓`、`PageUp` / `PageDown` | スクロール |
-| `Esc` | 閉じる |
+| `j` / `k` | Select the author, reply recipient, an image, a video, or a URL |
+| `f` | Follow the selected author or reply recipient (sends a request for a locked account) |
+| `R` | Reply to the post |
+| `t` | Open the reply tree |
+| `r` | Refresh the reply tree |
+| `c` | Resume the saved draft |
+| `Enter` | Open the selected account's profile, or open an image, video, or URL in an external application |
+| `o` | Open the selected image, video, or URL in an external application |
+| `↑` / `↓`, `PageUp` / `PageDown` | Scroll |
+| `Esc` | Close |
 
-プロフィール画面では `j` / `k` で投稿を選択し、`Enter` で詳細を開き、`R` で返信できます。上下キーまたは `PageUp` / `PageDown` でプロフィール情報をスクロールし、`n` で過去の投稿を追加取得できます。`Esc` で前の画面に戻ります。返信ツリーでも `j` / `k` で投稿を選び、`Enter` で詳細を開くか、`R` で返信できます。どちらの画面でも `c` で保持した下書きを再開できます。ツリーは最大 500 件を表示します。
+On a profile, use `j` / `k` to select a post, `Enter` to open its details, and `R` to reply. Use the Up / Down arrows or `PageUp` / `PageDown` to scroll through profile information, and `n` to load older posts. Press `Esc` to return to the previous screen. In the reply tree, use `j` / `k` to select a post, then `Enter` to open its details or `R` to reply. Press `c` in either screen to resume a saved draft. The tree displays up to 500 posts.
 
-## 設定とフォント
+## Settings and fonts
 
-`s` で設定画面を開き、`j` / `k` で項目、`h` / `l` で値を変更できます。設定は `$XDG_CONFIG_HOME/lazydon/settings.json`（既定: `~/.config/lazydon/settings.json`）に保存されます。
+Press `s` to open settings, `j` / `k` to select an item, and `h` / `l` to change its value. Settings are saved in `$XDG_CONFIG_HOME/lazydon/settings.json` (default: `~/.config/lazydon/settings.json`).
 
-- **テーマ:** Dark / Light / High contrast
-- **表示密度:** Compact（既定） / Comfortable
-- **フォント:** **Noto Sans Mono CJK JP** など Unicode 罫線・Truecolor 対応の端末／フォントを推奨します。Kitty（remote control 有効時）では設定画面の `Font size`（8〜24 pt、`0` で既定値）を `Enter` で適用できます。
+- **Theme:** Dark / Light / High contrast
+- **Display density:** Compact (default) / Comfortable
+- **Font:** A terminal and font with Unicode box-drawing and Truecolor support, such as **Noto Sans Mono CJK JP**, are recommended. In Kitty with remote control enabled, apply the `Font size` setting (8–24 pt, or `0` for the default) by pressing `Enter`.
 
-## 開発
+## Development
 
-ビルドやテストの方法は [開発ガイド](https://github.com/hama6767/LazyDon/blob/main/doc/development.md) を参照してください。
+See the [development guide](https://github.com/hama6767/LazyDon/blob/main/docs/development.md) for build and test instructions.

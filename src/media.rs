@@ -186,6 +186,9 @@ fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
 
 /// Read a PNG image from a Wayland or X11 clipboard. No shell is involved.
 pub fn clipboard_png() -> Result<Vec<u8>> {
+    if cfg!(target_os = "macos") {
+        bail!("Clipboard image attachments are not supported on macOS");
+    }
     let mut errors = Vec::new();
     for (program, args) in [
         ("wl-paste", &["--type", "image/png"][..]),

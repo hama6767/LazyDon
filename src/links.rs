@@ -79,17 +79,34 @@ pub fn open(url: &str) -> Result<()> {
     if !valid_url(url) {
         bail!("Only HTTP(S) URLs without credentials can be opened");
     }
-    let mut child = Command::new("xdg-open")
+    let program = opener_command(cfg!(target_os = "macos"));
+    let mut child = Command::new(program)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("Could not start xdg-open")?;
+        .with_context(|| format!("Could not start {program}"))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
+}
+
+fn opener_command(macos: bool) -> &'static str {
+    if macos {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+fn clipboard_commands(macos: bool) -> &'static [(&'static str, &'static [&'static str])] {
+    if macos {
+        &[("pbcopy", &[])]
+    } else {
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])]
+    }
 }
 
 /// Copy the complete URL without relying on how the terminal wraps it.
@@ -97,14 +114,17 @@ pub fn copy_to_clipboard(url: &str) -> Result<()> {
     if !valid_url(url) {
         bail!("Only HTTP(S) URLs without credentials can be copied");
     }
-    let candidates: &[(&str, &[&str])] =
-        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
-    for &(program, args) in candidates {
+    let macos = cfg!(target_os = "macos");
+    for &(program, args) in clipboard_commands(macos) {
         if copy_with_command(program, args, url).is_ok() {
             return Ok(());
         }
     }
-    bail!("Could not copy URL; install wl-copy (Wayland) or xclip (X11)")
+    if macos {
+        bail!("Could not copy URL using pbcopy")
+    } else {
+        bail!("Could not copy URL; install wl-copy (Wayland) or xclip (X11)")
+    }
 }
 
 fn copy_with_command(program: &str, args: &[&str], url: &str) -> Result<()> {
@@ -140,6 +160,20 @@ mod tests {
         assert!(!valid_url("https://user:password@example.org/"));
         assert!(!valid_url("https://example.org/\x1b[2J"));
         assert!(!valid_url("--help"));
+    }
+
+    #[test]
+    fn selects_desktop_commands_for_each_platform() {
+        assert_eq!(opener_command(true), "open");
+        assert_eq!(opener_command(false), "xdg-open");
+        assert_eq!(clipboard_commands(true), &[("pbcopy", &[][..])]);
+        assert_eq!(
+            clipboard_commands(false),
+            &[
+                ("wl-copy", &[][..]),
+                ("xclip", &["-selection", "clipboard"][..])
+            ]
+        );
     }
 
     #[test]

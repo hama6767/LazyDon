@@ -1,4 +1,4 @@
-name: Attach latest main build to release
+name: Attach latest main builds to release
 
 on:
   release:
@@ -9,62 +9,98 @@ permissions:
   contents: write
 
 jobs:
-  attach-linux:
+  attach-builds:
     runs-on: ubuntu-22.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
-      # Resolve the main branch at release time, not the release tag. If a build
-      # is still running, wait for it; if artifacts expired, trigger a new build.
-      - name: Find a successful build for latest main
+      # Resolve both workflows against the same latest main commit. Wait for
+      # ongoing builds or dispatch missing/expired ones before attaching files.
+      - name: Find successful builds for latest main
         id: build
         uses: actions/github-script@v7
         with:
           script: |
             const { owner, repo } = context.repo;
+            const workflows = [
+              { id: 'linux.yml', artifacts: ['lazydon-linux-x86_64', 'lazydon-linux-aarch64'], output: 'linux_run_id' },
+              { id: 'macos.yml', artifacts: ['lazydon-macos-aarch64'], output: 'macos_run_id' },
+            ];
+            const dispatched = new Map();
             let lastSha = '';
-            let dispatchedFor = '';
-            let dispatchedAt = 0;
-            for (let attempt = 0; attempt < 120; attempt++) {
+            for (let attempt = 0; attempt < 180; attempt++) {
               const branch = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
               const sha = branch.data.commit.sha;
               if (sha !== lastSha) {
                 core.info(`Current main: ${sha}`);
                 lastSha = sha;
               }
-              const result = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id: 'linux.yml', branch: 'main', head_sha: sha, per_page: 30
-              });
-              const runs = result.data.workflow_runs.filter(run => run.head_sha === sha);
-              for (const run of runs.filter(run => run.status === 'completed' && run.conclusion === 'success')) {
-                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id });
-                if (artifacts.data.artifacts.some(a => a.name === 'lazydon-linux-x86_64' && !a.expired)) {
-                  core.setOutput('run_id', String(run.id));
+              const builds = [];
+              for (const workflow of workflows) {
+                const result = await github.rest.actions.listWorkflowRuns({
+                  owner, repo, workflow_id: workflow.id, branch: 'main', head_sha: sha, per_page: 30,
+                });
+                const runs = result.data.workflow_runs.filter(run => run.head_sha === sha);
+                let found;
+                for (const run of runs.filter(run => run.status === 'completed' && run.conclusion === 'success')) {
+                  const result = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id, per_page: 100 });
+                  if (workflow.artifacts.every(name => result.data.artifacts.some(a => a.name === name && !a.expired))) {
+                    found = run.id;
+                    break;
+                  }
+                }
+                if (found) {
+                  builds.push({ workflow, runId: found });
+                  continue;
+                }
+                const key = `${sha}:${workflow.id}`;
+                const dispatchedAt = dispatched.get(key);
+                const pending = runs.some(run => run.status !== 'completed');
+                const failedAfterDispatch = dispatchedAt && runs.some(run =>
+                  Date.parse(run.created_at) >= dispatchedAt - 2000 &&
+                  run.status === 'completed' && run.conclusion !== 'success'
+                );
+                if (!pending && failedAfterDispatch) {
+                  throw new Error(`${workflow.id} build for main ${sha} failed. Fix or rerun the build before publishing.`);
+                }
+                if (!pending && !dispatchedAt) {
+                  core.info(`No usable ${workflow.id} artifact for ${sha}; dispatching a main build.`);
+                  dispatched.set(key, Date.now());
+                  await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflow.id, ref: 'main' });
+                }
+              }
+              if (builds.length === workflows.length) {
+                const current = await github.rest.repos.getBranch({ owner, repo, branch: 'main' });
+                if (current.data.commit.sha === sha) {
+                  for (const build of builds) core.setOutput(build.workflow.output, String(build.runId));
                   core.setOutput('sha', sha);
                   return;
                 }
               }
-              const pending = runs.some(run => run.status !== 'completed');
-              const dispatchedRuns = runs.filter(run => Date.parse(run.created_at) >= dispatchedAt - 2000);
-              if (!pending && dispatchedFor === sha && dispatchedRuns.some(run => run.status === 'completed' && run.conclusion && run.conclusion !== 'success')) {
-                throw new Error(`Linux build for main ${sha} failed. Fix or rerun the build before publishing.`);
-              }
-              if (!pending && dispatchedFor !== sha) {
-                core.info(`No usable artifact for ${sha}; dispatching a main build.`);
-                dispatchedAt = Date.now();
-                await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: 'linux.yml', ref: 'main' });
-                dispatchedFor = sha;
-              }
               await new Promise(resolve => setTimeout(resolve, 10000));
             }
-            throw new Error('Timed out waiting for a successful Linux build of main.');
-      - name: Download main build artifact
+            throw new Error('Timed out waiting for all successful builds of main.');
+      - name: Download Linux x86_64 build
         uses: actions/download-artifact@v4
         with:
           name: lazydon-linux-x86_64
-          path: dist
-          run-id: ${{ steps.build.outputs.run_id }}
+          path: dist/linux-x86_64
+          run-id: ${{ steps.build.outputs.linux_run_id }}
           github-token: ${{ github.token }}
-      - name: Attach artifacts to the release
+      - name: Download Linux ARM64 build
+        uses: actions/download-artifact@v4
+        with:
+          name: lazydon-linux-aarch64
+          path: dist/linux-aarch64
+          run-id: ${{ steps.build.outputs.linux_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download macOS Apple Silicon build
+        uses: actions/download-artifact@v4
+        with:
+          name: lazydon-macos-aarch64
+          path: dist/macos-aarch64
+          run-id: ${{ steps.build.outputs.macos_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify and attach builds to the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -72,7 +108,14 @@ jobs:
           BUILD_SHA: ${{ steps.build.outputs.sha }}
         run: |
           set -euo pipefail
-          echo "Attaching Linux build from main commit $BUILD_SHA"
-          cd dist
-          sha256sum --check lazydon-linux-x86_64.tar.gz.sha256
-          gh release upload "$RELEASE_TAG" lazydon-linux-x86_64.tar.gz lazydon-linux-x86_64.tar.gz.sha256 --clobber
+          echo "Attaching builds from main commit $BUILD_SHA"
+          (cd dist/linux-x86_64 && sha256sum --check lazydon-linux-x86_64.tar.gz.sha256)
+          (cd dist/linux-aarch64 && sha256sum --check lazydon-linux-aarch64.tar.gz.sha256)
+          (cd dist/macos-aarch64 && sha256sum --check lazydon-macos-aarch64.tar.gz.sha256)
+          gh release upload "$RELEASE_TAG" \
+            dist/linux-x86_64/lazydon-linux-x86_64.tar.gz \
+            dist/linux-x86_64/lazydon-linux-x86_64.tar.gz.sha256 \
+            dist/linux-aarch64/lazydon-linux-aarch64.tar.gz \
+            dist/linux-aarch64/lazydon-linux-aarch64.tar.gz.sha256 \
+            dist/macos-aarch64/lazydon-macos-aarch64.tar.gz \
+            dist/macos-aarch64/lazydon-macos-aarch64.tar.gz.sha256 --clobber
