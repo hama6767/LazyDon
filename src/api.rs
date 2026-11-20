@@ -58,28 +58,6 @@ impl Config {
             Err(e) => Err(e).with_context(|| format!("設定を読み込めません: {}", path.display())),
         }
     }
-
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        let parent = path.parent().context("設定パスが不正です")?;
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&path)?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            serde_json::to_writer_pretty(&mut file, self)?;
-        }
-        #[cfg(not(unix))]
-        fs::write(&path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
-    }
 }
 
 #[derive(Clone)]

@@ -1,3 +1,4 @@
+mod accounts;
 mod api;
 mod app;
 mod formatting;
@@ -18,7 +19,7 @@ fn prompt(label: &str) -> Result<String> {
     io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_owned())
 }
-fn login() -> Result<api::Config> {
+fn login() -> Result<(api::Config, api::Account)> {
     println!("Mastodon login: register LazyDon on your server, then authorize it in your browser.");
     let instance = prompt("Server (e.g. mastodon.social): ")?;
     let auth = api::register_app(&instance)?;
@@ -28,35 +29,34 @@ fn login() -> Result<api::Config> {
     let account = api::Mastodon::new(config.clone())?
         .verify_credentials()
         .context("Could not verify the account")?;
-    config.save()?;
     println!("Logged in as @{}", account.acct);
-    Ok(config)
+    Ok((config, account))
 }
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("LazyDon — Vim-inspired Mastodon client\n\nUsage: lazydon [--login]\n\n--login  Register and authorize an account again\n-h, --help  Show this help");
+        println!("LazyDon — Vim-inspired Mastodon client\n\nUsage: lazydon [--login]\n\n--login  Add or reauthorize an account\n-h, --help  Show this help");
         return Ok(());
     }
     if args.iter().any(|a| a != "--login") {
         anyhow::bail!("Unknown option. See --help.");
     }
-    let config = if args.iter().any(|a| a == "--login") {
-        login()?
-    } else {
-        match api::Config::load()? {
-            Some(c) => c,
-            None => login()?,
+    let mut store = accounts::AccountStore::load()?;
+    if args.iter().any(|a| a == "--login") || store.accounts.is_empty() {
+        let (config, account) = login()?;
+        let mut candidate = store.clone();
+        candidate.add_with_identity(config, account)?;
+        candidate.save()?;
+        if let Err(e) = candidate.cleanup_removed_legacy() {
+            eprintln!("Old credential cleanup failed: {e:#}");
         }
-    };
-    let account = api::Mastodon::new(config.clone())?
-        .verify_credentials()
-        .context("Account verification failed; run with --login to authenticate again")?;
+        store = candidate;
+    }
     let mut terminal = ratatui::init();
     let enabled = crossterm::execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
     let result = enabled
         .context("Could not enable bracketed paste")
-        .and_then(|_| app::run(&mut terminal, config, format!("@{}", account.acct)));
+        .and_then(|_| app::run(&mut terminal, store));
     let disabled = crossterm::execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
     result?;

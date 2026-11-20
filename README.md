@@ -2,11 +2,11 @@
 
 Vim 風のキーで操作する Mastodon のターミナルクライアントです。ホームを表示しながら通知を常設カラムで確認でき、ローカルと連合のタイムラインを必要に応じて追加できます。投稿者ごとの固定色とツリー風の行で、投稿・ブースト・通知を見分けられます。メンションはユーザーごとの色で表示し、リンクの参照番号は表示しません。CPU・RAM のモニターは Linux の `/proc` からおよそ 1 秒ごとに更新します。
 
-![LazyDon の画面プレビュー（架空の投稿・通知と CPU/RAM 使用率）](docs/preview.png)
+![LazyDon の画面プレビュー（架空の投稿・通知と CPU/RAM 使用率）](https://raw.githubusercontent.com/hama6767/LazyDon/main/docs/preview.png)
 
 ## 必要なもの
 
-- Rust と Cargo（Rust 1.91 で動作確認）
+- Linux x86_64（GitHub Release の配布版。Ubuntu 22.04 でビルド）
 - Mastodon のアカウントと、HTTPS で接続できるサーバー
 - 画像プレビューには Kitty、iTerm2、Sixel の端末画像プロトコルを自動検出して使用します。非対応端末ではカラーの半角ブロックにフォールバックします。環境変数 `LAZYDON_IMAGE_PROTOCOL` に `kitty`、`iterm2`、`sixel`、`halfblocks` を指定すると方式を固定できます。tmux や screen 内では既定で半角ブロックを使います。選択時に画像がダウンロードされます。
 - 元画像・動画・リンクを開くには Linux の `xdg-open` と、関連付けられたブラウザーやビューアー。
@@ -14,24 +14,49 @@ Vim 風のキーで操作する Mastodon のターミナルクライアントで
 
 端末画像プロトコルに対応しない場合、Unicode の罫線と半角ブロックおよび Truecolor に対応した端末・フォントを推奨します。
 
-## 起動とログイン
+## インストールと起動
+
+Linux x86_64 では、次のコマンドで最新リリースをインストールできます。`curl`、`tar`、`sha256sum` が必要です。アーカイブの SHA-256 を確認してから `~/.local/bin/lazydon` に配置します。管理者権限は不要です。
 
 ```sh
-git clone https://github.com/hama6767/LazyDon.git
-cd LazyDon
-cargo run --release
+curl -fsSLo install-lazydon.sh https://raw.githubusercontent.com/hama6767/LazyDon/main/install.sh
+sh install-lazydon.sh
+export PATH="$HOME/.local/bin:$PATH"
+lazydon
 ```
 
-初回起動時にサーバー名を入力し、表示された URL をブラウザーで開いて認証します。認証後に表示されるコードをターミナルへ貼り付けてください。認証には Mastodon の OOB（コード貼り付け）方式を使います。サーバー側でこの方式やアプリ登録が許可されている必要があります。別アカウントに切り替える場合は `cargo run --release -- --login` を実行します。
+`lazydon: command not found` と表示された場合は、次を実行してもう一度 `lazydon` を起動してください。
 
-トークンは `$XDG_CONFIG_HOME/lazydon/config.json`、未設定時は `~/.config/lazydon/config.json` に保存されます。Unix 系では設定ディレクトリを 0700、ファイルを 0600 に設定します。このファイルはパスワードと同様に扱ってください。ログアウトするにはファイルを削除し、必要に応じてサーバーのアプリ設定で認可も取り消してください。
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+lazydon
+```
 
-旧名 tootui の設定がある場合、新しい設定ファイルがなければ `$XDG_CONFIG_HOME/tootui/config.json`（未設定時は `~/.config/tootui/config.json`）も読み込みます。旧設定は自動削除されません。ログアウトする際は、存在する場合は旧設定も削除してください。
+毎回設定しなくてよいように、Bash などを使っている場合は `export PATH="$HOME/.local/bin:$PATH"` を `~/.profile` に追加し、ログインし直すこともできます。別の保存先を使う場合は `LAZYDON_INSTALL_DIR` を設定してインストーラーを実行し、そのディレクトリを `PATH` に追加してください。
+
+手動で利用する場合は [Releases](https://github.com/hama6767/LazyDon/releases) から `lazydon-linux-x86_64.tar.gz` と `lazydon-linux-x86_64.tar.gz.sha256` を同じディレクトリにダウンロードし、以下を実行します。
+
+```sh
+sha256sum -c lazydon-linux-x86_64.tar.gz.sha256
+tar -xzf lazydon-linux-x86_64.tar.gz
+./lazydon
+```
+
+## ログイン
+
+初回起動時にサーバー名を入力し、表示された URL をブラウザーで開いて認証します。認証後に表示されるコードをターミナルへ貼り付けてください。認証には Mastodon の OOB（コード貼り付け）方式を使います。サーバー側でこの方式やアプリ登録が許可されている必要があります。
+
+複数のアカウントを追加できます。`s` で設定を開き、`Accounts` を選んで `Enter` を押すとアカウント管理画面が開きます。`a` でアカウントを追加し、サーバー名の入力とブラウザーでの認証を行ってください。追加したアカウントは `[` / `]` または `gT` / `gt` で画面ごと切り替えられます。アカウント管理画面では `j` / `k` で選択し、`Enter` で切り替え、`d` の後に `y` で削除します。最後のアカウントを削除するとアプリは終了します。
+
+トークンは `$XDG_CONFIG_HOME/lazydon/accounts.json`、未設定時は `~/.config/lazydon/accounts.json` に保存されます。Unix 系では設定ディレクトリを 0700、ファイルを 0600 に設定します。このファイルはパスワードと同様に扱ってください。アカウントの削除は保存された認証情報を削除します。サーバー側のアプリ設定で認可を取り消すこともできます。
+
+既存の単一アカウント設定がある場合、初回起動時に新しいアカウント設定へ移行します。移行後も旧設定は残りますが、そのアカウントを削除すると一致する旧設定も削除します。
 
 ## キー操作
 
 | キー | 操作 |
 | --- | --- |
+| `[` / `]`、`gT` / `gt` | 前 / 次のアカウント画面へ |
 | `j` / `k`、上下キー | 投稿を選択 |
 | `g` / `G` | 先頭 / 末尾へ |
 | `h` / `l`、左右キー | タイムラインと通知の操作対象を切り替え |
@@ -40,7 +65,7 @@ cargo run --release
 | `f` / `b` | お気に入り / ブーストを切り替え |
 | `Enter` | 選択中の投稿の詳細を開く |
 | `c` | 投稿画面を開く |
-| `s` | 表示設定を開く |
+| `s` | 設定を開く（表示・アカウント管理） |
 | `?` | ヘルプ |
 | `q` | 終了 |
 
@@ -56,15 +81,6 @@ cargo run --release
 
 ターミナルアプリがフォントを描画するため、LazyDon 自体にフォントを組み込んだり、あらゆる端末の文字サイズを共通の方法で変更したりすることはできません。端末側で **Noto Sans Mono CJK JP** などのフォントと好みの小さめのサイズを設定してください。Kitty で remote control が許可されている場合は、設定画面の Font size を 8〜24 pt から選んで `Enter` で適用できます。`0` を押してから `Enter` で Kitty の既定値に戻します。この操作は同じ OS ウィンドウ内の分割画面にも影響します。起動時に端末のフォントサイズを変更することはありません。
 
-## 開発
+## 開発者向け情報
 
-```sh
-cargo test
-cargo build --release
-```
-
-ネットワーク要求はバックグラウンドで実行します。実際の投稿・お気に入り・ブーストは接続先サーバーに反映されます。
-
-## Linux のビルドと Release
-
-GitHub Actions は `main` への push と pull request ごとに Linux x86_64（Ubuntu 22.04）用のテストとリリースビルドを実行し、アーカイブと SHA-256 ファイルを成果物に保存します。GitHub Release を公開すると、公開時点の `main` の最新コミットに対応する成功済み Linux ビルドを添付します。ビルドが実行中なら完了を待ち、成果物が期限切れの場合は `main` のビルドを再実行します。Release のタグが指すコミットとは異なる場合があるため、同梱の `BUILD.txt` でソースのコミットを確認できます。GitHub はタグ側のワークフロー定義を使うため、Release のタグはこのワークフローが含まれるコミット以降に作成してください。
+ソースからのビルドやテストについては [開発ガイド](https://github.com/hama6767/LazyDon/blob/main/doc/development.md) を参照してください。

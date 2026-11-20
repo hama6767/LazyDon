@@ -5,7 +5,11 @@ use anyhow::{bail, Context, Result};
 use reqwest::{blocking::Client, header};
 use std::{
     io::{BufRead, BufReader, Read},
-    sync::mpsc::Sender,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -40,14 +44,16 @@ pub enum StreamMessage {
     Disconnected(StreamKind),
 }
 
-/// Start a single connection loop. The receiver disappearing stops the worker
-/// after its current bounded request; the process can exit without joining it.
-pub fn start(config: Config, kind: StreamKind, tx: Sender<StreamMessage>) {
+/// Start a connection loop; cancellation is shared by all workers for an account.
+pub fn start(config: Config, kind: StreamKind, tx: Sender<StreamMessage>, cancel: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut delay = Duration::from_secs(2);
-        loop {
+        while !cancel.load(Ordering::Relaxed) {
             let started = Instant::now();
-            let result = connect(&config, kind, &tx);
+            let result = connect(&config, kind, &tx, &cancel);
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             if tx.send(StreamMessage::Disconnected(kind)).is_err() {
                 break;
             }
@@ -58,9 +64,23 @@ pub fn start(config: Config, kind: StreamKind, tx: Sender<StreamMessage>) {
             if result.is_err() && delay < Duration::from_secs(60) {
                 delay = (delay * 2).min(Duration::from_secs(60));
             }
-            thread::sleep(delay);
+            if !sleep_until_retry(delay, &cancel) {
+                break;
+            }
         }
     });
+}
+
+fn sleep_until_retry(delay: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + delay;
+    while !cancel.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    false
 }
 
 fn client(timeout: Duration) -> Result<Client> {
@@ -72,12 +92,15 @@ fn client(timeout: Duration) -> Result<Client> {
         .build()?)
 }
 
-fn streaming_base(config: &Config) -> Result<String> {
+fn streaming_base(config: &Config, cancel: &AtomicBool) -> Result<String> {
     let instance = normalize_instance(&config.instance)?;
     let client = client(Duration::from_secs(15))?;
     // The authenticated instance supplies the streaming host. Never follow HTTP
     // redirects with a bearer token, and never allow an HTTPS-to-HTTP downgrade.
     let discover = |path: &str, pointer: &str| {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         client
             .get(format!("{instance}{path}"))
             .bearer_auth(&config.access_token)
@@ -132,8 +155,16 @@ fn validate_stream_base(value: &str, instance: &str) -> Result<String> {
     url.set_path("");
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
-fn connect(config: &Config, kind: StreamKind, tx: &Sender<StreamMessage>) -> Result<()> {
-    let base = streaming_base(config)?;
+fn connect(
+    config: &Config,
+    kind: StreamKind,
+    tx: &Sender<StreamMessage>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let base = streaming_base(config, cancel)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     if config.access_token.trim().is_empty() {
         bail!("empty access token");
     }
@@ -145,10 +176,13 @@ fn connect(config: &Config, kind: StreamKind, tx: &Sender<StreamMessage>) -> Res
         .header(header::ACCEPT, "text/event-stream")
         .send()?
         .error_for_status()?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     tx.send(StreamMessage::Connected(kind))
         .map_err(|_| anyhow::anyhow!("receiver closed"))?;
-    read_events(BufReader::new(response), |event| {
-        tx.send(StreamMessage::Event(kind, event)).is_ok()
+    read_events(BufReader::new(response), cancel, |event| {
+        !cancel.load(Ordering::Relaxed) && tx.send(StreamMessage::Event(kind, event)).is_ok()
     })
 }
 fn parse_event(name: &str, data: &str) -> Option<StreamEvent> {
@@ -163,16 +197,26 @@ fn parse_event(name: &str, data: &str) -> Option<StreamEvent> {
         _ => None,
     }
 }
-fn read_events(mut reader: impl BufRead, mut emit: impl FnMut(StreamEvent) -> bool) -> Result<()> {
+fn read_events(
+    mut reader: impl BufRead,
+    cancel: &AtomicBool,
+    mut emit: impl FnMut(StreamEvent) -> bool,
+) -> Result<()> {
     const LIMIT: u64 = 1024 * 1024;
     let mut name = String::new();
     let mut data = String::new();
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let mut bytes = Vec::new();
         let n = reader
             .by_ref()
             .take(LIMIT + 1)
             .read_until(b'\n', &mut bytes)?;
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if n == 0 {
             break;
         }
@@ -215,11 +259,65 @@ fn read_events(mut reader: impl BufRead, mut emit: impl FnMut(StreamEvent) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CancelOnHeartbeat<'a> {
+        input: std::io::Cursor<&'a [u8]>,
+        cancel: &'a AtomicBool,
+    }
+    impl Read for CancelOnHeartbeat<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl BufRead for CancelOnHeartbeat<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.input.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.input.consume(amt);
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn cancellation_is_checked_after_heartbeat_before_next_event() {
+        let input = b":thump\nevent: delete\ndata: 42\n\n";
+        let cancel = AtomicBool::new(false);
+        let mut reader = CancelOnHeartbeat {
+            input: std::io::Cursor::new(input),
+            cancel: &cancel,
+        };
+        let mut events = Vec::new();
+        read_events(&mut reader, &cancel, |event| {
+            events.push(event);
+            true
+        })
+        .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(reader.input.position(), b":thump\n".len() as u64);
+    }
+
+    #[test]
+    fn cancellation_interrupts_reconnect_backoff() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let start = Instant::now();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            sleep_until_retry(Duration::from_secs(60), &flag)
+        });
+        started_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!worker.join().unwrap());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
     #[test]
     fn parses_multiline_events_and_heartbeats() {
         let input = b":thump\r\nevent: update\r\ndata: {\"id\":\"42\",\r\ndata: \"content\":\"hello\"}\r\n\r\nevent: delete\ndata: 42\n\n";
         let mut events = vec![];
-        read_events(&input[..], |event| {
+        read_events(&input[..], &AtomicBool::new(false), |event| {
             events.push(event);
             true
         })

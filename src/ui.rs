@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -31,7 +31,7 @@ impl Palette {
                 muted: Color::Gray,
                 accent: Color::Cyan,
                 accent_text: Color::Black,
-                selection: Color::Rgb(34, 48, 57),
+                selection: Color::Rgb(44, 72, 84),
                 compose: Color::Rgb(25, 31, 39),
                 warning: Color::Yellow,
                 light: false,
@@ -42,7 +42,7 @@ impl Palette {
                 muted: Color::Rgb(83, 94, 108),
                 accent: Color::Rgb(0, 100, 125),
                 accent_text: Color::White,
-                selection: Color::Rgb(201, 226, 235),
+                selection: Color::Rgb(170, 212, 227),
                 compose: Color::Rgb(230, 237, 244),
                 warning: Color::Rgb(130, 75, 0),
                 light: true,
@@ -53,7 +53,7 @@ impl Palette {
                 muted: Color::Gray,
                 accent: Color::LightCyan,
                 accent_text: Color::Black,
-                selection: Color::Rgb(55, 55, 90),
+                selection: Color::Rgb(74, 74, 116),
                 compose: Color::Rgb(20, 20, 20),
                 warning: Color::Yellow,
                 light: false,
@@ -79,19 +79,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(area);
 
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " LazyDon ",
-            Style::default()
-                .fg(p.accent_text)
-                .bg(p.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(&app.account, Style::default().fg(p.accent)),
-        Span::raw("  ·  "),
-        Span::styled(&app.instance, Style::default().fg(p.muted)),
-    ]))
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                " LazyDon ",
+                Style::default()
+                    .fg(p.accent_text)
+                    .bg(p.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(&app.instance, Style::default().fg(p.muted)),
+            Span::styled("   [ / ] or gt / gT: account", Style::default().fg(p.muted)),
+        ]),
+        account_tabs(&app.account_labels, app.active_account, area.width, p),
+    ])
     .block(
         Block::default()
             .borders(Borders::BOTTOM)
@@ -186,6 +188,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         )),
     ]);
     frame.render_widget(footer, rows[2]);
+    draw_favourite_effect(frame, app, rows[2], p);
 
     match app.mode {
         Mode::Normal => {}
@@ -205,7 +208,92 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Mode::Compose => draw_compose(frame, app, p),
         Mode::Detail => draw_detail_popup(frame, app, p),
         Mode::Settings => draw_settings(frame, app, p),
+        Mode::AccountManage => draw_accounts(frame, app, p),
+        Mode::AccountAdd => draw_account_add(frame, app, p),
+        Mode::AccountDeleteConfirm => draw_account_delete(frame, app, p),
     }
+}
+
+// Keep the current account visible even when the full tab line is wider than
+// the terminal. Other account names are shown in their original order.
+fn account_tabs(labels: &[String], active: usize, width: u16, p: Palette) -> Line<'static> {
+    if labels.is_empty() {
+        return Line::from(" No accounts ");
+    }
+    let active = active.min(labels.len() - 1);
+    let available = (width as usize).saturating_sub(2);
+    let mut start = active;
+    let mut used = labels[active].width() + 3;
+    while start > 0 {
+        let next = labels[start - 1].width() + 3;
+        if used + next > available {
+            break;
+        }
+        start -= 1;
+        used += next;
+    }
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("‹ ", Style::default().fg(p.muted)));
+    }
+    let mut consumed = if start > 0 { 2 } else { 0 };
+    for (i, label) in labels.iter().enumerate().skip(start) {
+        let len = label.width() + 3;
+        if i > active && consumed + len > width as usize {
+            break;
+        }
+        let style = if i == active {
+            Style::default()
+                .fg(p.accent_text)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.muted)
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+        spans.push(Span::raw(" "));
+        consumed += len;
+    }
+    Line::from(spans)
+}
+
+fn selection_style(focused: bool, p: Palette) -> Style {
+    if focused {
+        Style::default()
+            .bg(p.selection)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
+}
+
+fn draw_favourite_effect(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
+    let Some((id, started)) = &app.favourite_effect else {
+        return;
+    };
+    let selected_id = app
+        .tabs
+        .get(app.active)
+        .and_then(|tab| tab.items.get(tab.selected))
+        .map(|item| &item.id);
+    if app.mode != Mode::Normal
+        || started.elapsed() >= std::time::Duration::from_millis(1200)
+        || selected_id != Some(id)
+        || area.width < 16
+        || area.height == 0
+    {
+        return;
+    }
+    let toast = Rect::new(area.x + area.width - 15, area.y, 15, 1);
+    frame.render_widget(
+        Paragraph::new(" ♥ Favourited ").style(
+            Style::default()
+                .fg(p.accent_text)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        toast,
+    );
 }
 
 fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
@@ -261,7 +349,7 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
     let timeline_focused = timeline_index == Some(app.active);
     let list = List::new(items)
         .block(panel(&title, timeline_focused, p))
-        .highlight_style(Style::default().bg(p.selection))
+        .highlight_style(selection_style(timeline_focused, p))
         .highlight_symbol(if timeline_focused { "▌" } else { " " });
     let mut state = ListState::default();
     if !tab.items.is_empty() {
@@ -302,7 +390,7 @@ fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) 
             .collect::<Vec<_>>(),
     )
     .block(panel(&title, focused, p))
-    .highlight_style(Style::default().bg(p.selection))
+    .highlight_style(selection_style(focused, p))
     .highlight_symbol(if focused { "▌" } else { " " });
     let mut state = ListState::default();
     if !tab.items.is_empty() {
@@ -858,6 +946,10 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, p: Palette) {
         ("Theme", app.settings.theme.label().to_owned()),
         ("Density", app.settings.density.label().to_owned()),
         ("Font size", value),
+        (
+            "Accounts",
+            format!("{} configured · Enter to manage", app.account_labels.len()),
+        ),
     ];
     let mut lines = vec![
         Line::from(""),
@@ -913,6 +1005,154 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, p: Palette) {
     );
 }
 
+fn draw_accounts(frame: &mut Frame<'_>, app: &App, p: Palette) {
+    let area = centered_rect(76, 70, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(" Accounts ", true, p);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(" j/k select · Enter switch · a add · d remove · Esc back")
+            .style(Style::default().fg(p.muted))
+            .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    let rows: Vec<_> = app
+        .account_labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let active = if i == app.active_account {
+                "  (current)"
+            } else {
+                ""
+            };
+            ListItem::new(format!(" {label}{active}"))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(Some(app.settings_account_index.min(rows.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(rows).highlight_symbol("▸").highlight_style(
+            Style::default()
+                .fg(p.accent)
+                .bg(p.selection)
+                .add_modifier(Modifier::BOLD),
+        ),
+        sections[1],
+        &mut state,
+    );
+    frame.render_widget(
+        Paragraph::new(app.settings_message.as_str())
+            .style(Style::default().fg(p.warning))
+            .wrap(Wrap { trim: false }),
+        sections[2],
+    );
+}
+
+fn draw_account_add(frame: &mut Frame<'_>, app: &App, p: Palette) {
+    let area = centered_rect(84, 70, frame.area());
+    frame.render_widget(Clear, area);
+    let block = panel(" Add account ", true, p);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // Give the field and status their own rows so a long OAuth URL cannot
+    // push the editable field or an error message out of the popup.
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let (instruction, value, hint, label) = if app.account_add_step == 0 {
+        (
+            "Enter your Mastodon server (for example, mastodon.social).",
+            app.account_input.clone(),
+            "Enter: continue   Esc: cancel",
+            "Server: ",
+        )
+    } else {
+        (
+            "Authorize LazyDon in your browser, then paste the authorization code.",
+            "•".repeat(app.account_input.chars().count()),
+            "Ctrl-O: open URL   Enter: add account   Esc: cancel",
+            "Code: ",
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(instruction).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    if app.account_add_step != 0 {
+        frame.render_widget(
+            Paragraph::new(app.auth_url.as_str())
+                .style(Style::default().fg(p.accent))
+                .wrap(Wrap { trim: false }),
+            sections[1],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(label, Style::default().fg(p.accent)),
+            Span::raw(value.clone()),
+        ])),
+        sections[2],
+    );
+    frame.render_widget(
+        Paragraph::new(hint)
+            .style(Style::default().fg(p.muted))
+            .wrap(Wrap { trim: false }),
+        sections[3],
+    );
+    let status = if app.account_busy {
+        "Working…"
+    } else {
+        app.settings_message.as_str()
+    };
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(Style::default().fg(p.warning))
+            .wrap(Wrap { trim: false }),
+        sections[4],
+    );
+    if !app.account_busy && sections[2].width > 0 && sections[2].height > 0 {
+        let x = (label.width() + value.width()).min(sections[2].width.saturating_sub(1) as usize);
+        frame.set_cursor_position((sections[2].x + x as u16, sections[2].y));
+    }
+}
+
+fn draw_account_delete(frame: &mut Frame<'_>, app: &App, p: Palette) {
+    let label = app
+        .account_labels
+        .get(app.settings_account_index)
+        .map(String::as_str)
+        .unwrap_or("");
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(format!(" Remove {label} from LazyDon?")),
+        Line::from(" This removes locally stored credentials."),
+    ];
+    if app.account_labels.len() == 1 {
+        lines.push(Line::from(" Removing the last account exits LazyDon."));
+    }
+    lines.extend([Line::from(""), Line::from(" y: remove   n / Esc: cancel")]);
+    draw_popup(frame, " Remove account ", lines, 70, 40, p);
+}
+
 fn panel(title: &str, active: bool, p: Palette) -> Block<'_> {
     Block::default()
         .title(title.to_string())
@@ -963,12 +1203,13 @@ fn help_text<'a>() -> Vec<Line<'a>> {
         "j / k, ↓ / ↑   Move through posts",
         "g / G           First / last post",
         "h / l, ← / →   Switch timelines",
+        "[ / ], gt / gT  Switch account screens",
         "Enter           Show post details, media and links",
         "a               Add local or federated timeline",
         "c               Compose a post",
         "r               Refresh current timeline",
         "f / b           Toggle favourite / boost",
-        "s               Settings",
+        "s               Settings (including accounts)",
         "?               Toggle this help",
         "q               Quit",
         "",
@@ -1052,6 +1293,72 @@ mod tests {
         assert!(screen.contains("including splits"));
         assert!(screen.contains("0: terminal default"));
         assert!(screen.contains("Font change failed"));
+    }
+
+    #[test]
+    fn account_tabs_keep_active_account_visible_on_narrow_terminals() {
+        let labels = vec![
+            "@alice@example.com".into(),
+            "@bob@example.org".into(),
+            "@carol@example.net".into(),
+        ];
+        let line = account_tabs(&labels, 2, 25, Palette::new(Theme::Dark));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("@carol@example.net"));
+        assert!(!text.contains("@alice@example.com"));
+    }
+
+    #[test]
+    fn accounts_and_oauth_code_are_displayed_safely() {
+        let mut app = crate::app::test_app();
+        app.account_labels = vec!["@alice@example.com".into(), "@bob@example.org".into()];
+        app.active_account = 1;
+        app.settings_account_index = 0;
+        app.mode = Mode::AccountManage;
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("@alice@example.com"));
+        assert!(screen.contains("@bob@example.org  (current)"));
+        app.mode = Mode::AccountAdd;
+        app.account_add_step = 1;
+        app.account_input = "secret-code".into();
+        app.auth_url = "https://example.org/oauth/authorize".into();
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("https://example.org/oauth/authorize"));
+        assert!(!screen.contains("secret-code"));
+        assert!(screen.contains("••••"));
+        app.mode = Mode::AccountDeleteConfirm;
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("Remove @alice@example.com"));
+    }
+
+    #[test]
+    fn only_focused_pane_marks_and_highlights_its_selection() {
+        let mut app = crate::app::test_app();
+        let item = app.tabs[0].items[0].clone();
+        app.tabs[1].items.push(item);
+        let timeline = render(&mut app, 120, 36);
+        assert_eq!(timeline.matches('▌').count(), 1);
+        app.active = 1;
+        let notifications = render(&mut app, 120, 36);
+        assert_eq!(notifications.matches('▌').count(), 1);
+        assert_ne!(timeline.find('▌'), notifications.find('▌'));
+        let p = Palette::new(Theme::Dark);
+        assert_eq!(selection_style(true, p).bg, Some(p.selection));
+        assert_eq!(selection_style(false, p).bg, None);
+    }
+
+    #[test]
+    fn favourite_toast_is_transient_and_belongs_to_selected_post() {
+        let mut app = crate::app::test_app();
+        app.favourite_effect = Some(("1".into(), std::time::Instant::now()));
+        assert!(render(&mut app, 120, 36).contains("♥ Favourited"));
+        app.favourite_effect = Some(("other".into(), std::time::Instant::now()));
+        assert!(!render(&mut app, 120, 36).contains("♥ Favourited"));
+        app.favourite_effect = Some((
+            "1".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(2),
+        ));
+        assert!(!render(&mut app, 120, 36).contains("♥ Favourited"));
     }
 
     #[test]
