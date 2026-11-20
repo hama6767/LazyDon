@@ -1,6 +1,6 @@
 use crate::api::{Config, Mastodon, Notification, Status, Timeline};
 use crate::stream::{self, StreamEvent, StreamKind, StreamMessage};
-use crate::{links, media};
+use crate::{links, media, settings};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -18,6 +18,7 @@ pub enum Mode {
     AddTab,
     Help,
     Detail,
+    Settings,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -63,6 +64,10 @@ pub struct App {
     pub mode: Mode,
     pub input: String,
     pub input_cursor: usize,
+    pub settings: settings::Settings,
+    pub settings_index: usize,
+    pub settings_message: String,
+    pub font_candidate: Option<u8>,
     pub detail_index: usize,
     pub detail_scroll: u16,
     pub native_preview: Option<media::NativePreview>,
@@ -102,12 +107,6 @@ impl Tab {
         }
     }
 }
-fn plain(html: &str) -> String {
-    html2text::from_read(html.as_bytes(), 100)
-        .unwrap_or_else(|_| html.to_owned())
-        .trim()
-        .to_owned()
-}
 fn view(status: Status, context: String) -> ViewItem {
     let key = status.id.clone();
     let (status, context) = if let Some(ref original) = status.reblog {
@@ -118,7 +117,7 @@ fn view(status: Status, context: String) -> ViewItem {
     } else {
         (status, context)
     };
-    let mut content = plain(&status.content);
+    let mut content = crate::formatting::plain(&status.content);
     if !status.spoiler_text.is_empty() {
         content = format!("CW: {}\n{}", status.spoiler_text, content);
     }
@@ -333,6 +332,8 @@ fn event_applies(kind: Kind, stream: StreamKind, event: &StreamEvent) -> bool {
 impl App {
     fn new(config: Config, account: String) -> (Self, mpsc::Receiver<Message>) {
         let (tx, rx) = mpsc::channel();
+        let preferences = settings::Settings::load().unwrap_or_default();
+        let font_candidate = preferences.font_size;
         let (stream_tx, stream_rx) = mpsc::channel();
         let app_tx = tx.clone();
         thread::spawn(move || {
@@ -350,6 +351,10 @@ impl App {
                 mode: Mode::Normal,
                 input: String::new(),
                 input_cursor: 0,
+                settings: preferences,
+                settings_index: 0,
+                settings_message: String::new(),
+                font_candidate,
                 detail_index: 0,
                 detail_scroll: 0,
                 native_preview: None,
@@ -610,6 +615,12 @@ impl App {
             Mode::Normal => match key.code {
                 KeyCode::Char('q') => return true,
                 KeyCode::Char('?') => self.mode = Mode::Help,
+                KeyCode::Char('s') => {
+                    self.mode = Mode::Settings;
+                    self.settings_index = 0;
+                    self.settings_message.clear();
+                    self.font_candidate = self.settings.font_size;
+                }
                 KeyCode::Enter => {
                     if self.selected().is_some() {
                         self.detail_index = 0;
@@ -683,6 +694,67 @@ impl App {
                     self.mode = Mode::Normal;
                 }
             }
+            Mode::Settings => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.settings_index = (self.settings_index + 1).min(2)
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.settings_index = self.settings_index.saturating_sub(1)
+                }
+                KeyCode::Char('0') if self.settings_index == 2 => self.font_candidate = None,
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('l') | KeyCode::Right => {
+                    let forward = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
+                    match self.settings_index {
+                        0 => {
+                            self.settings.theme = if forward {
+                                self.settings.theme.next()
+                            } else {
+                                self.settings.theme.previous()
+                            };
+                        }
+                        1 => {
+                            self.settings.density = if forward {
+                                self.settings.density.next()
+                            } else {
+                                self.settings.density.previous()
+                            };
+                        }
+                        _ => {
+                            self.font_candidate = Some(match (self.font_candidate, forward) {
+                                (None, true) => 10,
+                                (None, false) => 9,
+                                (Some(size), true) => size.saturating_add(1).min(24),
+                                (Some(size), false) => size.saturating_sub(1).max(8),
+                            });
+                        }
+                    }
+                    if self.settings_index < 2 {
+                        self.settings_message = match self.settings.save() {
+                            Ok(()) => "Settings saved.".into(),
+                            Err(e) => format!("Could not save settings: {e:#}"),
+                        };
+                        self.status = self.settings_message.clone();
+                    }
+                }
+                KeyCode::Enter if self.settings_index == 2 => {
+                    self.settings_message =
+                        match settings::apply_kitty_font_size(self.font_candidate) {
+                            Ok(()) => {
+                                self.settings.font_size = self.font_candidate;
+                                match self.settings.save() {
+                                    Ok(()) => "Kitty font size applied and saved.".into(),
+                                    Err(e) => {
+                                        format!("Font applied; could not save settings: {e:#}")
+                                    }
+                                }
+                            }
+                            Err(e) => format!("Font unchanged: {e:#}"),
+                        };
+                    self.status = self.settings_message.clone();
+                }
+                _ => {}
+            },
             Mode::Detail => {
                 let count = self
                     .selected()
@@ -829,6 +901,11 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, config: Config, account: Str
                 Event::Paste(text) if app.mode == Mode::Compose && !app.busy => {
                     app.insert_text(&text)
                 }
+                Event::Resize(_, _) => {
+                    app.picker = media::image_picker();
+                    app.preview_url = None;
+                    app.update_preview();
+                }
                 _ => {}
             }
         }
@@ -843,6 +920,8 @@ pub(crate) fn test_app() -> App {
         access_token: "test".into(),
     };
     let (mut app, _) = App::new(config, "@me".into());
+    app.settings = settings::Settings::default();
+    app.font_candidate = None;
     app.tabs[0].items.push(ViewItem {
         id: "1".into(),
         key: "1".into(),
@@ -884,6 +963,15 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Compose));
         assert_eq!(app.input, "あ");
+    }
+    #[test]
+    fn settings_message_survives_stream_status_changes() {
+        let mut app = test_app();
+        app.mode = Mode::Settings;
+        app.settings_message = "Font unchanged: unavailable".into();
+        app.handle_stream(StreamMessage::Disconnected(StreamKind::User));
+        assert_eq!(app.settings_message, "Font unchanged: unavailable");
+        assert!(app.status.contains("reconnecting"));
     }
     #[test]
     fn japanese_draft_paste_and_grapheme_editing() {

@@ -1,7 +1,10 @@
 mod api;
 mod app;
+mod formatting;
 mod links;
 mod media;
+mod metrics;
+mod settings;
 mod stream;
 mod ui;
 

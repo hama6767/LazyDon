@@ -1,4 +1,5 @@
 use crate::app::{App, Mode, ViewItem};
+use crate::settings::{Density, Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -8,9 +9,67 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
+#[derive(Clone, Copy)]
+struct Palette {
+    background: Color,
+    text: Color,
+    muted: Color,
+    accent: Color,
+    accent_text: Color,
+    selection: Color,
+    compose: Color,
+    warning: Color,
+    light: bool,
+}
+
+impl Palette {
+    fn new(theme: Theme) -> Self {
+        match theme {
+            Theme::Dark => Self {
+                background: Color::Rgb(18, 22, 29),
+                text: Color::White,
+                muted: Color::Gray,
+                accent: Color::Cyan,
+                accent_text: Color::Black,
+                selection: Color::Rgb(34, 48, 57),
+                compose: Color::Rgb(25, 31, 39),
+                warning: Color::Yellow,
+                light: false,
+            },
+            Theme::Light => Self {
+                background: Color::Rgb(245, 247, 250),
+                text: Color::Rgb(24, 32, 44),
+                muted: Color::Rgb(83, 94, 108),
+                accent: Color::Rgb(0, 100, 125),
+                accent_text: Color::White,
+                selection: Color::Rgb(201, 226, 235),
+                compose: Color::Rgb(230, 237, 244),
+                warning: Color::Rgb(130, 75, 0),
+                light: true,
+            },
+            Theme::HighContrast => Self {
+                background: Color::Black,
+                text: Color::White,
+                muted: Color::Gray,
+                accent: Color::LightCyan,
+                accent_text: Color::Black,
+                selection: Color::Rgb(55, 55, 90),
+                compose: Color::Rgb(20, 20, 20),
+                warning: Color::Yellow,
+                light: false,
+            },
+        }
+    }
+}
+
 /// Draw the interface from the current application state.
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    let p = Palette::new(app.settings.theme);
+    frame.render_widget(
+        Block::default().style(Style::default().fg(p.text).bg(p.background)),
+        area,
+    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,24 +83,24 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Span::styled(
             " LazyDon ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(p.accent_text)
+                .bg(p.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(&app.account, Style::default().fg(Color::Cyan)),
+        Span::styled(&app.account, Style::default().fg(p.accent)),
         Span::raw("  ·  "),
-        Span::styled(&app.instance, Style::default().fg(Color::DarkGray)),
+        Span::styled(&app.instance, Style::default().fg(p.muted)),
     ]))
     .block(
         Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(p.muted)),
     );
     frame.render_widget(header, rows[0]);
 
-    // Keep notifications visible while preserving room for the selected post.
-    // On narrower terminals the same three panels stack vertically.
+    // Reserve a short strip across the post and notification panes for the
+    // system monitor. On compact terminals it is placed below all three panes.
     if rows[1].width >= 105 {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -51,10 +110,46 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 Constraint::Percentage(28),
             ])
             .split(rows[1]);
-        draw_timeline(frame, app, columns[0]);
-        draw_detail(frame, app, columns[1]);
-        draw_notifications(frame, app, columns[2]);
+        draw_timeline(frame, app, columns[0], p);
+        let right = Rect::new(
+            columns[1].x,
+            rows[1].y,
+            columns[1].width + columns[2].width,
+            rows[1].height,
+        );
+        let monitor_height = if right.height >= 12 { 4 } else { 0 };
+        let top_height = right.height.saturating_sub(monitor_height);
+        draw_detail(
+            frame,
+            app,
+            Rect::new(columns[1].x, columns[1].y, columns[1].width, top_height),
+            p,
+        );
+        draw_notifications(
+            frame,
+            app,
+            Rect::new(columns[2].x, columns[2].y, columns[2].width, top_height),
+            p,
+        );
+        if monitor_height > 0 {
+            draw_metrics(
+                frame,
+                Rect::new(right.x, right.y + top_height, right.width, monitor_height),
+                p,
+            );
+        }
     } else {
+        let monitor_height = if rows[1].height >= 20 && rows[1].width >= 30 {
+            4
+        } else {
+            0
+        };
+        let main = Rect::new(
+            rows[1].x,
+            rows[1].y,
+            rows[1].width,
+            rows[1].height.saturating_sub(monitor_height),
+        );
         let panels = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -62,27 +157,39 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 Constraint::Percentage(32),
                 Constraint::Percentage(28),
             ])
-            .split(rows[1]);
-        draw_timeline(frame, app, panels[0]);
-        draw_detail(frame, app, panels[1]);
-        draw_notifications(frame, app, panels[2]);
+            .split(main);
+        draw_timeline(frame, app, panels[0], p);
+        draw_detail(frame, app, panels[1], p);
+        draw_notifications(frame, app, panels[2], p);
+        if monitor_height > 0 {
+            draw_metrics(
+                frame,
+                Rect::new(
+                    rows[1].x,
+                    main.y + main.height,
+                    rows[1].width,
+                    monitor_height,
+                ),
+                p,
+            );
+        }
     }
 
     let footer = Paragraph::new(vec![
         Line::from(Span::styled(
             &app.status,
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(p.warning),
         )),
         Line::from(Span::styled(
-            "j/k move  h/l tab  Enter details  a add  c compose  f favourite  b boost  ? help  q quit",
-            Style::default().fg(Color::DarkGray),
+            "j/k move  h/l tab  Enter details  a add  c compose  f favourite  b boost  s settings  ? help  q quit",
+            Style::default().fg(p.muted),
         )),
     ]);
     frame.render_widget(footer, rows[2]);
 
     match app.mode {
         Mode::Normal => {}
-        Mode::Help => draw_popup(frame, " Help ", help_text(), 76, 75),
+        Mode::Help => draw_popup(frame, " Help ", help_text(), 76, 75, p),
         Mode::AddTab => draw_popup(
             frame,
             " Add timeline ",
@@ -93,13 +200,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             ],
             58,
             30,
+            p,
         ),
-        Mode::Compose => draw_compose(frame, app),
-        Mode::Detail => draw_detail_popup(frame, app),
+        Mode::Compose => draw_compose(frame, app, p),
+        Mode::Detail => draw_detail_popup(frame, app, p),
+        Mode::Settings => draw_settings(frame, app, p),
     }
 }
 
-fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
     // Notifications have their own persistent panel. When it has focus, keep
     // the Home timeline alongside it instead of showing the same list twice.
     let timeline_index = app
@@ -110,7 +219,7 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .or_else(|| app.tabs.iter().position(|tab| tab.title == "Home"));
     let Some(tab) = timeline_index.and_then(|index| app.tabs.get(index)) else {
         frame.render_widget(
-            Paragraph::new("No timelines").block(panel(" Timelines ", true)),
+            Paragraph::new("No timelines").block(panel(" Timelines ", true, p)),
             area,
         );
         return;
@@ -123,11 +232,11 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
     for (i, tab) in app.tabs.iter().enumerate() {
         let style = if i == app.active {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(p.accent_text)
+                .bg(p.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(p.muted)
         };
         tab_spans.push(Span::styled(format!(" {} ", tab.title), style));
         tab_spans.push(Span::raw(" "));
@@ -137,18 +246,22 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Timelines ")
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(p.muted)),
         ),
         sections[0],
     );
 
     let width = sections[1].width.saturating_sub(3) as usize;
-    let items: Vec<ListItem<'_>> = tab.items.iter().map(|item| item_row(item, width)).collect();
+    let items: Vec<ListItem<'_>> = tab
+        .items
+        .iter()
+        .map(|item| item_row(item, width, p, app.settings.density))
+        .collect();
     let title = format!(" {} · {} ", tab.title, tab.items.len());
     let timeline_focused = timeline_index == Some(app.active);
     let list = List::new(items)
-        .block(panel(&title, timeline_focused))
-        .highlight_style(Style::default().bg(Color::Rgb(34, 48, 57)))
+        .block(panel(&title, timeline_focused, p))
+        .highlight_style(Style::default().bg(p.selection))
         .highlight_symbol(if timeline_focused { "▌" } else { " " });
     let mut state = ListState::default();
     if !tab.items.is_empty() {
@@ -156,17 +269,17 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     frame.render_stateful_widget(list, sections[1], &mut state);
     if tab.items.is_empty() {
-        let inner = panel("", true).inner(sections[1]);
+        let inner = panel("", true, p).inner(sections[1]);
         frame.render_widget(
             Paragraph::new("No posts yet. Press r to refresh.")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(p.muted))
                 .wrap(Wrap { trim: true }),
             inner,
         );
     }
 }
 
-fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
     let Some((index, tab)) = app
         .tabs
         .iter()
@@ -174,7 +287,7 @@ fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .find(|(_, tab)| tab.title == "Notifications")
     else {
         frame.render_widget(
-            Paragraph::new("Notifications unavailable").block(panel(" Notifications ", false)),
+            Paragraph::new("Notifications unavailable").block(panel(" Notifications ", false, p)),
             area,
         );
         return;
@@ -185,11 +298,11 @@ fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let list = List::new(
         tab.items
             .iter()
-            .map(|item| notification_row(item, width))
+            .map(|item| notification_row(item, width, p, app.settings.density))
             .collect::<Vec<_>>(),
     )
-    .block(panel(&title, focused))
-    .highlight_style(Style::default().bg(Color::Rgb(34, 48, 57)))
+    .block(panel(&title, focused, p))
+    .highlight_style(Style::default().bg(p.selection))
     .highlight_symbol(if focused { "▌" } else { " " });
     let mut state = ListState::default();
     if !tab.items.is_empty() {
@@ -197,10 +310,10 @@ fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
     frame.render_stateful_widget(list, area, &mut state);
     if tab.items.is_empty() {
-        let inner = panel("", focused).inner(area);
+        let inner = panel("", focused, p).inner(area);
         frame.render_widget(
             Paragraph::new("No notifications yet.")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(p.muted))
                 .wrap(Wrap { trim: true }),
             inner,
         );
@@ -240,19 +353,61 @@ fn wrapped_lines(text: &str, width: usize, limit: usize) -> Vec<String> {
     out
 }
 
-fn body_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+fn mention_spans(text: &str, p: Palette) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let starts_mention = chars[i] == '@'
+            && i + 1 < chars.len()
+            && (chars[i + 1].is_ascii_alphanumeric() || chars[i + 1] == '_')
+            && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'));
+        if starts_mention {
+            if !plain.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut plain),
+                    Style::default().fg(p.text),
+                ));
+            }
+            let start = i;
+            i += 1;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '_' | '-' | '.' | '@'))
+            {
+                i += 1;
+            }
+            let mention: String = chars[start..i].iter().collect();
+            let account = mention.trim_start_matches('@').trim_end_matches('.');
+            spans.push(Span::styled(
+                mention.clone(),
+                Style::default()
+                    .fg(account_color(account, p))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            plain.push(chars[i]);
+            i += 1;
+        }
+    }
+    if !plain.is_empty() {
+        spans.push(Span::styled(plain, Style::default().fg(p.text)));
+    }
+    spans
+}
+
+fn body_lines(text: &str, width: usize, p: Palette) -> Vec<Line<'static>> {
     wrapped_lines(text, width.saturating_sub(5), 140)
         .into_iter()
         .map(|part| {
-            Line::from(vec![
-                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(part, Style::default().fg(Color::White)),
-            ])
+            let mut spans = vec![Span::styled("  │  ", Style::default().fg(p.muted))];
+            spans.extend(mention_spans(&part, p));
+            Line::from(spans)
         })
         .collect()
 }
 
-fn notification_row(item: &ViewItem, width: usize) -> ListItem<'_> {
+fn notification_row(item: &ViewItem, width: usize, p: Palette, density: Density) -> ListItem<'_> {
     let event = if item.context == "notification" {
         item.content.as_str()
     } else {
@@ -260,20 +415,21 @@ fn notification_row(item: &ViewItem, width: usize) -> ListItem<'_> {
     };
     let mut lines = vec![Line::from(Span::styled(
         event.to_owned(),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
     ))];
-    lines.extend(body_lines(&item.content, width));
+    lines.extend(body_lines(&item.content, width, p));
     lines.push(Line::from(Span::styled(
         format!("  └─ @{} · {}", item.acct, item.timestamp),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(p.muted),
     )));
+    if density == Density::Comfortable {
+        lines.push(Line::from(""));
+    }
     ListItem::new(lines)
 }
 
-fn item_row(item: &ViewItem, width: usize) -> ListItem<'_> {
-    let color = account_color(&item.acct);
+fn item_row(item: &ViewItem, width: usize, p: Palette, density: Density) -> ListItem<'_> {
+    let color = account_color(&item.acct, p);
     let context = if item.context.is_empty() {
         String::new()
     } else {
@@ -290,20 +446,20 @@ fn item_row(item: &ViewItem, width: usize) -> ListItem<'_> {
             item.author.as_str(),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(" @{}", item.acct),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!(" @{}", item.acct), Style::default().fg(p.muted)),
     ])];
-    lines.extend(body_lines(&item.content, width));
+    lines.extend(body_lines(&item.content, width, p));
     lines.push(Line::from(Span::styled(
         format!("  └─ {}{}{}", item.timestamp, context, media),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(p.muted),
     )));
+    if density == Density::Comfortable {
+        lines.push(Line::from(""));
+    }
     ListItem::new(lines)
 }
 
-fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect, p: Palette) {
     let Some(item) = app
         .tabs
         .get(app.active)
@@ -311,13 +467,13 @@ fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     else {
         frame.render_widget(
             Paragraph::new("Select a post to see its details.")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(panel(" Post ", false)),
+                .style(Style::default().fg(p.muted))
+                .block(panel(" Post ", false, p)),
             area,
         );
         return;
     };
-    let color = account_color(&item.acct);
+    let color = account_color(&item.acct, p);
     let mut lines = vec![
         Line::from(vec![
             Span::styled("● ", Style::default().fg(color)),
@@ -325,31 +481,27 @@ fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 item.author.as_str(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(" @{}", item.acct),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!(" @{}", item.acct), Style::default().fg(p.muted)),
         ]),
         Line::from(Span::styled(
             format!("{}  {}", item.timestamp, item.context),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.muted),
         )),
         Line::from(""),
     ];
-    lines.extend(item.content.lines().map(|line| {
-        Line::from(Span::styled(
-            line.to_owned(),
-            Style::default().fg(Color::White),
-        ))
-    }));
-    let block = panel(" Post ", false);
+    lines.extend(
+        item.content
+            .lines()
+            .map(|line| Line::from(mention_spans(line, p))),
+    );
+    let block = panel(" Post ", false, p);
     let inner = block.inner(area);
     if let Some(preview) = &item.link_preview {
         lines.extend(
             wrapped_lines(preview, inner.width.max(2) as usize, 200)
                 .into_iter()
                 .take(2)
-                .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))),
+                .map(|line| Line::from(Span::styled(line, Style::default().fg(p.accent)))),
         );
     }
     frame.render_widget(block, area);
@@ -381,7 +533,7 @@ fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
         frame.render_widget(
             Paragraph::new(format!("└─ Media ({})", item.media.len()))
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Style::default().fg(p.accent)),
             sections[1],
         );
         // Avoid emitting image graphics under a modal, where they could obscure it.
@@ -390,8 +542,7 @@ fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 preview.render(frame, sections[2]);
             } else {
                 frame.render_widget(
-                    Paragraph::new("Image preview unavailable")
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Paragraph::new("Image preview unavailable").style(Style::default().fg(p.muted)),
                     sections[2],
                 );
             }
@@ -399,10 +550,10 @@ fn draw_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_compose(frame: &mut Frame<'_>, app: &App) {
+fn draw_compose(frame: &mut Frame<'_>, app: &App, p: Palette) {
     let area = centered_rect(80, 75, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(" New post ", true);
+    let block = panel(" New post ", true, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let sections = Layout::default()
@@ -416,8 +567,8 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App) {
         .split(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Posting as ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&app.account, Style::default().fg(Color::Cyan)),
+            Span::styled("Posting as ", Style::default().fg(p.muted)),
+            Span::styled(&app.account, Style::default().fg(p.accent)),
         ])),
         sections[0],
     );
@@ -435,15 +586,15 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App) {
     let body = Text::from(draft_lines.into_iter().map(Line::from).collect::<Vec<_>>());
     frame.render_widget(
         Paragraph::new(body)
-            .block(panel(" Body · editing ", true))
+            .block(panel(" Body · editing ", true, p))
             .style(
                 Style::default()
                     .fg(if app.input.is_empty() {
-                        Color::DarkGray
+                        p.muted
                     } else {
-                        Color::White
+                        p.text
                     })
-                    .bg(Color::Rgb(25, 31, 39)),
+                    .bg(p.compose),
             )
             .scroll((scroll, 0)),
         sections[1],
@@ -461,24 +612,18 @@ fn draw_compose(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("Attachments  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Attachments  ", Style::default().fg(p.muted)),
                 Span::raw(format!("{} / 4 images", app.attachment_count())),
-                Span::styled(
-                    "    ·    Characters  ",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("    ·    Characters  ", Style::default().fg(p.muted)),
                 Span::raw(app.input.chars().count().to_string()),
             ]),
-            Line::from(Span::styled(
-                &app.status,
-                Style::default().fg(Color::Yellow),
-            )),
+            Line::from(Span::styled(&app.status, Style::default().fg(p.warning))),
         ]),
         sections[2],
     );
     frame.render_widget(
         Paragraph::new("Ctrl-S: send  ·  Ctrl-V: attach image  ·  Esc: keep draft")
-            .style(Style::default().fg(Color::Cyan))
+            .style(Style::default().fg(p.accent))
             .wrap(Wrap { trim: true }),
         sections[3],
     );
@@ -534,7 +679,7 @@ fn draft_layout(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize,
     (lines, caret.0, caret.1)
 }
 
-fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
+fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App, p: Palette) {
     let Some(item) = app
         .tabs
         .get(app.active)
@@ -544,7 +689,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
     };
     let area = centered_rect(88, 88, frame.area());
     frame.render_widget(Clear, area);
-    let block = panel(" Post details · Esc close ", true);
+    let block = panel(" Post details · Esc close ", true, p);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let mut lines = vec![
@@ -552,32 +697,33 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
             Span::styled(
                 item.author.as_str(),
                 Style::default()
-                    .fg(account_color(&item.acct))
+                    .fg(account_color(&item.acct, p))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!(" @{}", item.acct),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!(" @{}", item.acct), Style::default().fg(p.muted)),
         ]),
         Line::from(Span::styled(
             format!("{}  {}", item.timestamp, item.context),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.muted),
         )),
         Line::from(""),
     ];
     if !item.details.is_empty() {
         lines.push(Line::from(Span::styled(
             item.details.as_str(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.muted),
         )));
     }
-    lines.extend(item.content.split('\n').map(|s| Line::from(s.to_owned())));
+    lines.extend(
+        item.content
+            .split('\n')
+            .map(|s| Line::from(mention_spans(s, p))),
+    );
     if let Some(preview) = &item.link_preview {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Link preview",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(p.accent),
         )));
         lines.extend(preview.lines().map(|s| Line::from(s.to_owned())));
     }
@@ -585,7 +731,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Media and links · j/k select · Enter/o open",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(p.accent),
         )));
         for (i, attachment) in item.attachments.iter().enumerate() {
             let marker = if app.detail_index == i { "▸" } else { " " };
@@ -597,9 +743,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
             lines.push(Line::from(Span::styled(
                 format!("{} {} {}{}", marker, i + 1, attachment.kind, description),
                 if app.detail_index == i {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(p.warning).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 },
@@ -616,9 +760,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
             lines.push(Line::from(Span::styled(
                 format!("{} {} {}", marker, index + 1, link),
                 if app.detail_index == index {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().fg(p.warning).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 },
@@ -628,7 +770,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ PgUp/PgDown scroll · Esc close",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(p.muted),
     )));
     let (text_area, image_area) = if !item.media.is_empty()
         && app.native_preview.is_some()
@@ -650,7 +792,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
         text_area,
     );
     if let (Some(area), Some(preview)) = (image_area, &mut app.native_preview) {
-        let block = panel(" Media preview ", false);
+        let block = panel(" Media preview ", false, p);
         let image_area = block.inner(area);
         frame.render_widget(block, area);
         if image_area.width > 0 && image_area.height > 0 {
@@ -659,19 +801,139 @@ fn draw_detail_popup(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn panel(title: &str, active: bool) -> Block<'_> {
-    Block::default()
-        .title(title.to_string())
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }))
+fn draw_metrics(frame: &mut Frame<'_>, area: Rect, p: Palette) {
+    let metrics = crate::metrics::current();
+    let bar_width = (area.width as usize).saturating_sub(30).clamp(4, 40);
+    fn bar(value: Option<f64>, width: usize) -> String {
+        let filled = value
+            .map(|v| ((v.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize)
+            .unwrap_or(0);
+        format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    }
+    fn pct(value: Option<f64>) -> String {
+        value
+            .map(|v| format!("{:>5.1}%", v.clamp(0.0, 100.0)))
+            .unwrap_or_else(|| "   --%".into())
+    }
+    let memory = match (metrics.memory_used_bytes, metrics.memory_total_bytes) {
+        (Some(used), Some(total)) => format!(
+            " {:.1}/{:.1} GiB",
+            used as f64 / 1073741824.0,
+            total as f64 / 1073741824.0
+        ),
+        _ => String::new(),
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(" CPU ", Style::default().fg(p.muted)),
+            Span::styled(
+                bar(metrics.cpu_percent, bar_width),
+                Style::default().fg(p.accent),
+            ),
+            Span::raw(format!(" {}", pct(metrics.cpu_percent))),
+        ]),
+        Line::from(vec![
+            Span::styled(" RAM ", Style::default().fg(p.muted)),
+            Span::styled(
+                bar(metrics.memory_percent, bar_width),
+                Style::default().fg(p.accent),
+            ),
+            Span::raw(format!(" {}{}", pct(metrics.memory_percent), memory)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(panel(" System ", false, p)),
+        area,
+    );
 }
 
-fn draw_popup(frame: &mut Frame<'_>, title: &str, lines: Vec<Line<'_>>, width: u16, height: u16) {
+fn draw_settings(frame: &mut Frame<'_>, app: &App, p: Palette) {
+    let area = centered_rect(72, 55, frame.area());
+    frame.render_widget(Clear, area);
+    let value = app
+        .font_candidate
+        .map(|n| format!("{n} pt (Kitty)"))
+        .unwrap_or_else(|| "Terminal default".into());
+    let values = [
+        ("Theme", app.settings.theme.label().to_owned()),
+        ("Density", app.settings.density.label().to_owned()),
+        ("Font size", value),
+    ];
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(" j/k select · h/l change · Enter apply · Esc close"),
+        Line::from(""),
+    ];
+    for (i, (label, value)) in values.into_iter().enumerate() {
+        let selected = i == app.settings_index;
+        let style = if selected {
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} {:<12}  {}",
+                if selected { "▸" } else { " " },
+                label,
+                value
+            ),
+            style,
+        )));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            " 0: terminal default",
+            Style::default().fg(p.muted),
+        )),
+        Line::from(Span::styled(
+            " Font changes need Kitty remote control and affect the OS",
+            Style::default().fg(p.muted),
+        )),
+        Line::from(Span::styled(
+            " window, including splits. Other terminals use their settings.",
+            Style::default().fg(p.muted),
+        )),
+    ]);
+    let block = panel(" Settings ", true, p);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new(app.settings_message.as_str()).style(Style::default().fg(p.warning)),
+        sections[1],
+    );
+}
+
+fn panel(title: &str, active: bool, p: Palette) -> Block<'_> {
+    Block::default()
+        .title(title.to_string())
+        .style(Style::default().fg(p.text).bg(p.background))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if active { p.accent } else { p.muted }))
+}
+
+fn draw_popup(
+    frame: &mut Frame<'_>,
+    title: &str,
+    lines: Vec<Line<'_>>,
+    width: u16,
+    height: u16,
+    p: Palette,
+) {
     let area = centered_rect(width, height, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(panel(title, true))
+            .block(panel(title, true, p))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -706,6 +968,7 @@ fn help_text<'a>() -> Vec<Line<'a>> {
         "c               Compose a post",
         "r               Refresh current timeline",
         "f / b           Toggle favourite / boost",
+        "s               Settings",
         "?               Toggle this help",
         "q               Quit",
         "",
@@ -718,7 +981,7 @@ fn help_text<'a>() -> Vec<Line<'a>> {
     .collect()
 }
 
-fn account_color(account: &str) -> Color {
+fn account_color(account: &str, p: Palette) -> Color {
     const COLORS: [Color; 8] = [
         Color::Cyan,
         Color::Green,
@@ -733,7 +996,21 @@ fn account_color(account: &str) -> Color {
     let hash = account.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
         (hash ^ byte as u64).wrapping_mul(0x100000001b3)
     });
-    COLORS[hash as usize % COLORS.len()]
+    const LIGHT_COLORS: [Color; 8] = [
+        Color::Rgb(0, 98, 123),
+        Color::Rgb(0, 104, 68),
+        Color::Rgb(128, 76, 0),
+        Color::Rgb(137, 43, 130),
+        Color::Rgb(25, 75, 160),
+        Color::Rgb(34, 107, 38),
+        Color::Rgb(160, 45, 55),
+        Color::Rgb(122, 47, 138),
+    ];
+    if p.light {
+        LIGHT_COLORS[hash as usize % LIGHT_COLORS.len()]
+    } else {
+        COLORS[hash as usize % COLORS.len()]
+    }
 }
 
 #[cfg(test)]
@@ -754,6 +1031,57 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    #[test]
+    fn monitor_and_settings_are_visible() {
+        let mut app = crate::app::test_app();
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("System"));
+        assert!(screen.contains("CPU"));
+        assert!(screen.contains("RAM"));
+        app.mode = Mode::Settings;
+        app.settings_index = 2;
+        app.font_candidate = Some(11);
+        app.status = "Font change failed".into();
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("Settings"));
+        assert!(screen.contains("Theme"));
+        assert!(screen.contains("Density"));
+        assert!(screen.contains("11 pt (Kitty)"));
+        assert!(screen.contains("including splits"));
+        assert!(screen.contains("0: terminal default"));
+        assert!(screen.contains("Font change failed"));
+    }
+
+    #[test]
+    fn themes_and_density_change_visuals_without_touching_content() {
+        let mut app = crate::app::test_app();
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let dark = terminal.backend().buffer()[(119, 35)].bg;
+        app.settings.theme = Theme::Light;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let light = terminal.backend().buffer()[(119, 35)].bg;
+        assert_ne!(dark, light);
+        let item = &app.tabs[0].items[0];
+        let p = Palette::new(Theme::Light);
+        assert_eq!(
+            item_row(item, 40, p, Density::Comfortable).height(),
+            item_row(item, 40, p, Density::Compact).height() + 1
+        );
+    }
+
+    #[test]
+    fn mentions_have_account_color_and_do_not_color_email_addresses() {
+        let p = Palette::new(Theme::Dark);
+        let spans = mention_spans("こんにちは @siruserver mail@example.org", p);
+        let mention = spans.iter().find(|s| s.content == "@siruserver").unwrap();
+        assert_eq!(mention.style.fg, Some(account_color("siruserver", p)));
+        assert!(spans
+            .iter()
+            .any(|s| s.content.contains("mail@example.org") && s.style.fg == Some(p.text)));
     }
 
     #[test]
