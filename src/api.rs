@@ -276,6 +276,14 @@ pub struct Notification {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct Conversation {
+    pub id: String,
+    pub unread: bool,
+    pub last_status: Option<Status>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct Relationship {
     pub following: bool,
     pub requested: bool,
@@ -384,6 +392,14 @@ impl Mastodon {
                 .query(&[("limit", "40")])
                 .send()
                 .context("通知を取得できませんでした")?,
+        )
+    }
+    pub fn conversations(&self) -> Result<Vec<Conversation>> {
+        decode(
+            self.get("/api/v1/conversations")
+                .query(&[("limit", "40")])
+                .send()
+                .context("DMを取得できませんでした")?,
         )
     }
     pub fn post(

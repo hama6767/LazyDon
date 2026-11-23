@@ -1,6 +1,6 @@
 //! Mastodon server-sent events. Each subscribed timeline has one worker; all
 //! application state remains on the terminal thread.
-use crate::api::{normalize_instance, Config, Notification, Status};
+use crate::api::{normalize_instance, Config, Conversation, Notification, Status};
 use anyhow::{bail, Context, Result};
 use reqwest::{blocking::Client, header};
 use std::{
@@ -19,6 +19,7 @@ pub enum StreamKind {
     User,
     Local,
     Federated,
+    Direct,
 }
 impl StreamKind {
     fn path(self) -> &'static str {
@@ -26,6 +27,7 @@ impl StreamKind {
             Self::User => "/api/v1/streaming/user",
             Self::Local => "/api/v1/streaming/public/local",
             Self::Federated => "/api/v1/streaming/public",
+            Self::Direct => "/api/v1/streaming/direct",
         }
     }
 }
@@ -35,6 +37,7 @@ pub enum StreamEvent {
     Edit(Status),
     Delete(String),
     Notification(Notification),
+    Conversation(Conversation),
     RefreshNotifications,
 }
 #[derive(Debug)]
@@ -192,6 +195,9 @@ fn parse_event(name: &str, data: &str) -> Option<StreamEvent> {
         "notification" => serde_json::from_str(data)
             .ok()
             .map(StreamEvent::Notification),
+        "conversation" => serde_json::from_str(data)
+            .ok()
+            .map(StreamEvent::Conversation),
         "delete" if !data.is_empty() => Some(StreamEvent::Delete(data.to_owned())),
         "notifications_merged" => Some(StreamEvent::RefreshNotifications),
         _ => None,
@@ -326,6 +332,16 @@ mod tests {
             matches!(&events[0], StreamEvent::Update(s) if s.id == "42" && s.content == "hello")
         );
         assert!(matches!(&events[1], StreamEvent::Delete(id) if id == "42"));
+    }
+    #[test]
+    fn parses_direct_conversation_and_nullable_status() {
+        let event = parse_event(
+            "conversation",
+            r#"{"id":"conversation-1","unread":true,"last_status":null}"#,
+        );
+        assert!(
+            matches!(event, Some(StreamEvent::Conversation(c)) if c.id == "conversation-1" && c.unread && c.last_status.is_none())
+        );
     }
     #[test]
     fn validates_discovered_stream_host() {

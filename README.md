@@ -61,7 +61,7 @@ To follow users with an account authorized in an earlier version, add the same a
 | `[` / `]`, `gT` / `gt` | Switch to the previous / next account |
 | `j` / `k`, Up / Down | Select a post |
 | `g` / `G` | Move to the beginning / end |
-| `h` / `l`, Left / Right | Switch between the timeline and notifications |
+| `h` / `l`, Left / Right | Switch the focused timeline or panel |
 | `a` → `l` / `f` | Add a local / federated tab, or switch to it if already open |
 | `r` | Refresh the current tab |
 | `R` | Reply to the selected post |
@@ -108,6 +108,8 @@ Press `s` to open settings, `j` / `k` to select an item, and `h` / `l` to change
 
 - **Theme:** Dark / Light / High contrast
 - **Display density:** Compact (default) / Comfortable
+- **Layout:** Default shows notifications and direct messages on the right. Your timeline focus retains the original timeline and notifications layout. Federation shows the federated timeline above notifications.
+- **Direct messages:** The Default layout shows the latest message in each conversation. Opening a conversation does not mark it as read on the server.
 - **Font:** A terminal and font with Unicode box-drawing and Truecolor support, such as **Noto Sans Mono CJK JP**, are recommended. In Kitty with remote control enabled, apply the `Font size` setting (8–24 pt, or `0` for the default) by pressing `Enter`.
 
 ## Development

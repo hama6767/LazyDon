@@ -1,5 +1,5 @@
 use crate::app::{App, Mode, ViewItem};
-use crate::settings::{Density, Theme};
+use crate::settings::{Density, Layout as DisplayLayout, Theme};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -127,7 +127,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Rect::new(columns[1].x, columns[1].y, columns[1].width, top_height),
             p,
         );
-        draw_notifications(
+        draw_side_panels(
             frame,
             app,
             Rect::new(columns[2].x, columns[2].y, columns[2].width, top_height),
@@ -152,17 +152,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             rows[1].width,
             rows[1].height.saturating_sub(monitor_height),
         );
-        let panels = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let constraints = match app.settings.layout {
+            DisplayLayout::YourTimelineFocus => [
                 Constraint::Percentage(40),
                 Constraint::Percentage(32),
                 Constraint::Percentage(28),
-            ])
+            ],
+            _ => [
+                Constraint::Percentage(40),
+                Constraint::Percentage(24),
+                Constraint::Percentage(36),
+            ],
+        };
+        let panels = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
             .split(main);
         draw_timeline(frame, app, panels[0], p);
         draw_detail(frame, app, panels[1], p);
-        draw_notifications(frame, app, panels[2], p);
+        draw_side_panels(frame, app, panels[2], p);
         if monitor_height > 0 {
             draw_metrics(
                 frame,
@@ -299,14 +307,8 @@ fn draw_favourite_effect(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palett
 }
 
 fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
-    // Notifications have their own persistent panel. When it has focus, keep
-    // the Home timeline alongside it instead of showing the same list twice.
-    let timeline_index = app
-        .tabs
-        .get(app.active)
-        .filter(|tab| tab.title != "Notifications")
-        .map(|_| app.active)
-        .or_else(|| app.tabs.iter().position(|tab| tab.title == "Home"));
+    // Side panels have independent focus; retain the chosen left timeline.
+    let timeline_index = app.left_timeline_index();
     let Some(tab) = timeline_index.and_then(|index| app.tabs.get(index)) else {
         frame.render_widget(
             Paragraph::new("No timelines").block(panel(" Timelines ", true, p)),
@@ -320,6 +322,9 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
         .split(area);
     let mut tab_spans = Vec::new();
     for (i, tab) in app.tabs.iter().enumerate() {
+        if tab.title == "Direct messages" && app.settings.layout != DisplayLayout::Default {
+            continue;
+        }
         let style = if i == app.active {
             Style::default()
                 .fg(p.accent_text)
@@ -345,7 +350,15 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
     let items: Vec<ListItem<'_>> = tab
         .items
         .iter()
-        .map(|item| item_row(item, width, p, app.settings.density))
+        .map(|item| {
+            item_row_limited(
+                item,
+                width,
+                p,
+                app.settings.density,
+                sections[1].height.saturating_sub(2) as usize,
+            )
+        })
         .collect();
     let title = format!(" {} · {} ", tab.title, tab.items.len());
     let timeline_focused = timeline_index == Some(app.active);
@@ -362,6 +375,81 @@ fn draw_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
         let inner = panel("", true, p).inner(sections[1]);
         frame.render_widget(
             Paragraph::new("No posts yet. Press r to refresh.")
+                .style(Style::default().fg(p.muted))
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+    }
+}
+
+// The side panes share the same focus indicator as the main timeline. Keep the
+// system monitor outside this split so switching layouts does not hide it.
+fn draw_side_panels(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) {
+    match app.settings.layout {
+        DisplayLayout::YourTimelineFocus => draw_notifications(frame, app, area, p),
+        DisplayLayout::Default | DisplayLayout::Federation => {
+            let panes = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+            if app.settings.layout == DisplayLayout::Default {
+                draw_notifications(frame, app, panes[0], p);
+                draw_side_timeline(frame, app, panes[1], p, "Direct messages");
+            } else {
+                draw_side_timeline(frame, app, panes[0], p, "Federated");
+                draw_notifications(frame, app, panes[1], p);
+            }
+        }
+    }
+}
+
+fn draw_side_timeline(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette, name: &str) {
+    let Some((index, tab)) = app
+        .tabs
+        .iter()
+        .enumerate()
+        .find(|(_, tab)| tab.title == name)
+    else {
+        frame.render_widget(
+            Paragraph::new("Loading…").block(panel(&format!(" {name} "), false, p)),
+            area,
+        );
+        return;
+    };
+    let focused = index == app.active;
+    let title = format!(" {} · {} ", tab.title, tab.items.len());
+    let width = area.width.saturating_sub(3) as usize;
+    let list = List::new(
+        tab.items
+            .iter()
+            .map(|item| {
+                item_row_limited(
+                    item,
+                    width,
+                    p,
+                    app.settings.density,
+                    area.height.saturating_sub(2) as usize,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .block(panel(&title, focused, p))
+    .highlight_style(selection_style(focused, p))
+    .highlight_symbol(if focused { "▌" } else { " " });
+    let mut state = ListState::default();
+    if !tab.items.is_empty() {
+        state.select(Some(tab.selected.min(tab.items.len() - 1)));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+    if tab.items.is_empty() {
+        let inner = panel("", focused, p).inner(area);
+        let message = if name == "Direct messages" {
+            "No direct messages yet."
+        } else {
+            "No posts yet. Press r to refresh."
+        };
+        frame.render_widget(
+            Paragraph::new(message)
                 .style(Style::default().fg(p.muted))
                 .wrap(Wrap { trim: true }),
             inner,
@@ -388,7 +476,15 @@ fn draw_notifications(frame: &mut Frame<'_>, app: &App, area: Rect, p: Palette) 
     let list = List::new(
         tab.items
             .iter()
-            .map(|item| notification_row(item, width, p, app.settings.density))
+            .map(|item| {
+                notification_row(
+                    item,
+                    width,
+                    p,
+                    app.settings.density,
+                    area.height.saturating_sub(2) as usize,
+                )
+            })
             .collect::<Vec<_>>(),
     )
     .block(panel(&title, focused, p))
@@ -497,7 +593,13 @@ fn body_lines(text: &str, width: usize, p: Palette) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn notification_row(item: &ViewItem, width: usize, p: Palette, density: Density) -> ListItem<'_> {
+fn notification_row(
+    item: &ViewItem,
+    width: usize,
+    p: Palette,
+    density: Density,
+    max_height: usize,
+) -> ListItem<'_> {
     let event = if item.context == "notification" {
         item.content.as_str()
     } else {
@@ -515,10 +617,23 @@ fn notification_row(item: &ViewItem, width: usize, p: Palette, density: Density)
     if density == Density::Comfortable {
         lines.push(Line::from(""));
     }
+    // Ratatui skips a list item entirely when it is taller than the viewport.
+    // Keep its first visible lines so small panes still show a usable item.
+    lines.truncate(max_height.max(1));
     ListItem::new(lines)
 }
 
 fn item_row(item: &ViewItem, width: usize, p: Palette, density: Density) -> ListItem<'_> {
+    item_row_limited(item, width, p, density, usize::MAX)
+}
+
+fn item_row_limited(
+    item: &ViewItem,
+    width: usize,
+    p: Palette,
+    density: Density,
+    max_height: usize,
+) -> ListItem<'_> {
     let color = account_color(&item.acct, p);
     let context = if item.context.is_empty() {
         String::new()
@@ -546,6 +661,7 @@ fn item_row(item: &ViewItem, width: usize, p: Palette, density: Density) -> List
     if density == Density::Comfortable {
         lines.push(Line::from(""));
     }
+    lines.truncate(max_height.max(1));
     ListItem::new(lines)
 }
 
@@ -1271,7 +1387,7 @@ fn draw_metrics(frame: &mut Frame<'_>, area: Rect, p: Palette) {
 }
 
 fn draw_settings(frame: &mut Frame<'_>, app: &App, p: Palette) {
-    let area = centered_rect(72, 55, frame.area());
+    let area = centered_rect(72, 70, frame.area());
     frame.render_widget(Clear, area);
     let value = app
         .font_candidate
@@ -1280,6 +1396,7 @@ fn draw_settings(frame: &mut Frame<'_>, app: &App, p: Palette) {
     let values = [
         ("Theme", app.settings.theme.label().to_owned()),
         ("Density", app.settings.density.label().to_owned()),
+        ("Layout", app.settings.layout.label().to_owned()),
         ("Font size", value),
         (
             "Accounts",
@@ -1767,6 +1884,109 @@ mod tests {
         let screen = render(&mut app, 120, 36);
         assert!(screen.contains("Hello from Alice"));
         assert!(screen.matches("New mention").count() >= 2);
+    }
+
+    #[test]
+    fn layouts_keep_the_requested_panels_visible_in_order() {
+        fn side_row(screen: &str, label: &str) -> Option<usize> {
+            screen
+                .lines()
+                .position(|line| line.chars().skip(85).collect::<String>().contains(label))
+        }
+        let mut app = crate::app::test_app();
+        let screen = render(&mut app, 120, 36);
+        let notifications = side_row(&screen, "Notifications").unwrap();
+        let messages = side_row(&screen, "Direct messages").unwrap();
+        assert!(notifications < messages);
+        assert!(screen.contains("System"));
+
+        app.settings.layout = DisplayLayout::YourTimelineFocus;
+        let screen = render(&mut app, 120, 36);
+        assert!(side_row(&screen, "Notifications").is_some());
+        assert!(side_row(&screen, "Direct messages").is_none());
+
+        app.settings.layout = DisplayLayout::Federation;
+        let screen = render(&mut app, 120, 36);
+        let federation = side_row(&screen, "Federated").unwrap();
+        let notifications = side_row(&screen, "Notifications").unwrap();
+        assert!(federation < notifications);
+        assert!(screen.contains("System"));
+    }
+
+    #[test]
+    fn narrow_terminal_shows_the_selected_layout_panels() {
+        let mut app = crate::app::test_app();
+        crate::app::test_add_tab(&mut app, "Direct messages");
+        let dm_index = app
+            .tabs
+            .iter()
+            .position(|t| t.title == "Direct messages")
+            .unwrap();
+        let mut message = app.tabs[0].items[0].clone();
+        message.author = "Bob".into();
+        message.content = "A private message".into();
+        app.tabs[dm_index].items.push(message);
+        app.active = dm_index;
+        let screen = render(&mut app, 60, 30);
+        assert!(screen.contains("Notifications"));
+        let dm_row = screen
+            .lines()
+            .position(|line| line.contains("Direct messages"))
+            .unwrap();
+        assert!(screen
+            .lines()
+            .skip(dm_row + 1)
+            .any(|line| line.contains("A private message")));
+        app.settings.layout = DisplayLayout::YourTimelineFocus;
+        let screen = render(&mut app, 60, 36);
+        assert!(screen.contains("Notifications"));
+        assert!(!screen.contains("Direct messages"));
+        app.settings.layout = DisplayLayout::Federation;
+        let screen = render(&mut app, 60, 36);
+        assert!(screen.contains("Federated"));
+        assert!(screen.contains("Notifications"));
+        for width in [1, 10, 25, 60, 120] {
+            for height in [1, 5, 12, 30] {
+                let _ = render(&mut app, width, height);
+            }
+        }
+    }
+
+    #[test]
+    fn side_timeline_focus_keeps_home_visible_and_marks_only_one_selection() {
+        let mut app = crate::app::test_app();
+        crate::app::test_add_tab(&mut app, "Direct messages");
+        let dm_index = app
+            .tabs
+            .iter()
+            .position(|t| t.title == "Direct messages")
+            .unwrap();
+        let mut message = app.tabs[0].items[0].clone();
+        message.author = "Bob".into();
+        message.content = "A private message".into();
+        app.tabs[dm_index].items.push(message);
+        app.active = dm_index;
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("Hello from Alice"));
+        assert!(screen.contains("A private message"));
+        assert_eq!(screen.matches('▌').count(), 1);
+
+        crate::app::test_add_tab(&mut app, "Federated");
+        let federated_index = app
+            .tabs
+            .iter()
+            .position(|t| t.title == "Federated")
+            .unwrap();
+        let mut post = app.tabs[0].items[0].clone();
+        post.content = "A federated post".into();
+        app.tabs[federated_index].items.push(post);
+        app.settings.layout = DisplayLayout::Federation;
+        app.active = federated_index;
+        let screen = render(&mut app, 120, 36);
+        assert!(screen.contains("Hello from Alice"));
+        assert!(screen.contains("A federated post"));
+        assert!(!screen.contains("A private message"));
+        assert_eq!(screen.matches('▌').count(), 1);
     }
 
     #[test]

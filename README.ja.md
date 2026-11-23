@@ -61,7 +61,7 @@ tar -xzf lazydon-macos-aarch64.tar.gz
 | `[` / `]`、`gT` / `gt` | 前 / 次のアカウントへ切り替え |
 | `j` / `k`、上下キー | 投稿を選択 |
 | `g` / `G` | 先頭 / 末尾へ移動 |
-| `h` / `l`、左右キー | タイムラインと通知を切り替え |
+| `h` / `l`、左右キー | 操作するタイムライン・パネルを切り替え |
 | `a` → `l` / `f` | ローカル / 連合タブを追加（既存なら移動） |
 | `r` | 現在のタブを再取得 |
 | `R` | 選択した投稿に返信 |
@@ -108,6 +108,8 @@ Fcitx 5 / Fcitx では、画面を閉じたときや投稿に成功したとき�
 
 - **テーマ:** Dark / Light / High contrast
 - **表示密度:** Compact（既定） / Comfortable
+- **レイアウト:** Default は右側に通知と DM を表示します。Your timeline focus は従来のタイムラインと通知の配置です。Federation は右側に連合タイムラインと通知を上下に表示します。
+- **DM:** Default では会話ごとの最新メッセージを表示します。会話を開いてもサーバー側の未読状態は解除されません。
 - **フォント:** **Noto Sans Mono CJK JP** など Unicode 罫線・Truecolor 対応の端末／フォントを推奨します。Kitty（remote control 有効時）では設定画面の `Font size`（8〜24 pt、`0` で既定値）を `Enter` で適用できます。
 
 ## 開発

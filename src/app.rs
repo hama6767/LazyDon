@@ -1,4 +1,4 @@
-use crate::api::{self, Account, Config, Mastodon, Notification, Status, Timeline};
+use crate::api::{self, Account, Config, Conversation, Mastodon, Notification, Status, Timeline};
 use crate::stream::{self, StreamEvent, StreamKind, StreamMessage};
 use crate::{accounts, links, media, settings};
 use anyhow::Result;
@@ -35,6 +35,7 @@ enum Kind {
     Notifications,
     Local,
     Federated,
+    Direct,
 }
 pub struct Tab {
     pub title: String,
@@ -172,6 +173,8 @@ fn thread_entries(root: &str, statuses: Vec<Status>) -> Vec<ThreadEntry> {
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active: usize,
+    // The timeline shown on the left is independent of the focused side pane.
+    left_timeline: Kind,
     pub status: String,
     pub mode: Mode,
     pub input: String,
@@ -218,6 +221,7 @@ pub struct App {
     tx: Sender<Message>,
     stream_tx: Sender<StreamMessage>,
     stop_streams: Arc<AtomicBool>,
+    started_streams: HashSet<StreamKind>,
     pending: HashMap<Kind, (u64, Vec<StreamEvent>)>,
     pending_interactions: HashSet<(String, bool)>,
     request_id: u64,
@@ -256,6 +260,7 @@ impl Tab {
             Kind::Notifications => "Notifications",
             Kind::Local => "Local",
             Kind::Federated => "Federated",
+            Kind::Direct => "Direct messages",
         }
         .into();
         Self {
@@ -427,10 +432,23 @@ fn notification(n: Notification) -> ViewItem {
         }
     }
 }
+fn conversation(c: Conversation) -> Option<ViewItem> {
+    if c.id.is_empty() {
+        return None;
+    }
+    let mut item = view(
+        c.last_status?,
+        if c.unread { "DM · unread" } else { "DM" }.into(),
+    );
+    item.key = format!("conversation:{}", c.id);
+    Some(item)
+}
 // Keep the selected post stable as live items arrive and bound memory use.
 fn apply_event(tab: &mut Tab, event: &StreamEvent) {
     match event {
-        StreamEvent::Update(status) if tab.kind != Kind::Notifications => {
+        StreamEvent::Update(status)
+            if tab.kind != Kind::Notifications && tab.kind != Kind::Direct =>
+        {
             let item = view(status.clone(), String::new());
             if item.key.is_empty() || tab.items.iter().any(|existing| existing.key == item.key) {
                 return;
@@ -453,6 +471,18 @@ fn apply_event(tab: &mut Tab, event: &StreamEvent) {
             tab.items.insert(0, item);
             tab.items.truncate(200);
             tab.selected = tab.selected.min(tab.items.len().saturating_sub(1));
+        }
+        StreamEvent::Conversation(c) if tab.kind == Kind::Direct && !c.id.is_empty() => {
+            let selected = tab.items.get(tab.selected).map(|item| item.key.clone());
+            let key = format!("conversation:{}", c.id);
+            tab.items.retain(|item| item.key != key);
+            if let Some(item) = conversation(c.clone()) {
+                tab.items.insert(0, item);
+                tab.items.truncate(200);
+            }
+            tab.selected = selected
+                .and_then(|key| tab.items.iter().position(|item| item.key == key))
+                .unwrap_or_else(|| tab.selected.min(tab.items.len().saturating_sub(1)));
         }
         StreamEvent::Delete(id) => {
             let before = tab
@@ -499,6 +529,7 @@ fn event_applies(kind: Kind, stream: StreamKind, event: &StreamEvent) -> bool {
                 | (Kind::Federated, StreamKind::Federated)
         ),
         StreamEvent::Notification(_) => kind == Kind::Notifications && stream == StreamKind::User,
+        StreamEvent::Conversation(_) => kind == Kind::Direct && stream == StreamKind::Direct,
         StreamEvent::Delete(_) | StreamEvent::Edit(_) => true,
         StreamEvent::RefreshNotifications => false,
     }
@@ -539,6 +570,7 @@ impl App {
             Self {
                 tabs: vec![Tab::new(Kind::Home), Tab::new(Kind::Notifications)],
                 active: 0,
+                left_timeline: Kind::Home,
                 status: "Loading…".into(),
                 mode: Mode::Normal,
                 input: String::new(),
@@ -586,6 +618,7 @@ impl App {
                 tx,
                 stream_tx,
                 stop_streams: Arc::new(AtomicBool::new(false)),
+                started_streams: HashSet::new(),
                 pending: HashMap::new(),
                 request_id: 0,
                 preview_url: None,
@@ -648,6 +681,114 @@ impl App {
             let _ = tx.send(Message::ReplyIdentity(generation, result));
         });
     }
+    fn start_stream(&mut self, kind: StreamKind) -> bool {
+        if self.started_streams.insert(kind) {
+            stream::start(
+                self.config.clone(),
+                kind,
+                self.stream_tx.clone(),
+                self.stop_streams.clone(),
+            );
+            true
+        } else {
+            false
+        }
+    }
+    fn ensure_tab(&mut self, kind: Kind) -> usize {
+        let index = match self.tabs.iter().position(|tab| tab.kind == kind) {
+            Some(index) => index,
+            None => {
+                self.tabs.push(Tab::new(kind));
+                self.tabs.len() - 1
+            }
+        };
+        let stream = match kind {
+            Kind::Local => StreamKind::Local,
+            Kind::Federated => StreamKind::Federated,
+            Kind::Direct => StreamKind::Direct,
+            _ => unreachable!(),
+        };
+        if self.start_stream(stream) {
+            self.refresh(kind);
+        }
+        index
+    }
+    fn visible_tabs(&self) -> Vec<usize> {
+        use settings::Layout;
+        let mut indices: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| {
+                matches!(tab.kind, Kind::Home | Kind::Local)
+                    || (tab.kind == Kind::Federated && self.settings.layout != Layout::Federation)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let right: &[Kind] = match self.settings.layout {
+            Layout::Default => &[Kind::Notifications, Kind::Direct],
+            Layout::YourTimelineFocus => &[Kind::Notifications],
+            Layout::Federation => &[Kind::Federated, Kind::Notifications],
+        };
+        for kind in right {
+            if let Some(index) = self.tabs.iter().position(|tab| tab.kind == *kind) {
+                indices.push(index);
+            }
+        }
+        indices
+    }
+    fn sync_layout(&mut self) {
+        match self.settings.layout {
+            settings::Layout::Default => {
+                self.ensure_tab(Kind::Direct);
+            }
+            settings::Layout::Federation => {
+                self.ensure_tab(Kind::Federated);
+            }
+            settings::Layout::YourTimelineFocus => {}
+        }
+        if !self.visible_tabs().contains(&self.active) {
+            self.active = self.left_timeline_index().unwrap_or(0);
+            self.update_preview();
+        }
+    }
+    fn is_left_timeline(&self, kind: Kind) -> bool {
+        matches!(kind, Kind::Home | Kind::Local)
+            || (kind == Kind::Federated && self.settings.layout != settings::Layout::Federation)
+    }
+    fn remember_left_timeline(&mut self) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            if self.is_left_timeline(tab.kind) {
+                self.left_timeline = tab.kind;
+            }
+        }
+    }
+    pub(crate) fn left_timeline_index(&self) -> Option<usize> {
+        self.tabs
+            .get(self.active)
+            .filter(|tab| self.is_left_timeline(tab.kind))
+            .map(|_| self.active)
+            .or_else(|| {
+                self.tabs.iter().position(|tab| {
+                    tab.kind == self.left_timeline && self.is_left_timeline(tab.kind)
+                })
+            })
+            .or_else(|| self.tabs.iter().position(|tab| tab.kind == Kind::Home))
+    }
+    fn move_focus(&mut self, forward: bool) {
+        self.remember_left_timeline();
+        let indices = self.visible_tabs();
+        if let Some(position) = indices.iter().position(|&index| index == self.active) {
+            let next = if forward {
+                (position + 1).min(indices.len() - 1)
+            } else {
+                position.saturating_sub(1)
+            };
+            self.active = indices[next];
+            self.remember_left_timeline();
+            self.update_preview();
+        }
+    }
     fn refresh(&mut self, kind: Kind) {
         self.request_id += 1;
         let request_id = self.request_id;
@@ -663,6 +804,11 @@ impl App {
                         .notifications()?
                         .into_iter()
                         .map(notification)
+                        .collect(),
+                    Kind::Direct => client
+                        .conversations()?
+                        .into_iter()
+                        .filter_map(conversation)
                         .collect(),
                     other => client
                         .timeline(match other {
@@ -691,6 +837,7 @@ impl App {
                     }
                     StreamKind::Local => self.refresh(Kind::Local),
                     StreamKind::Federated => self.refresh(Kind::Federated),
+                    StreamKind::Direct => self.refresh(Kind::Direct),
                 }
             }
             StreamMessage::Disconnected(StreamKind::User) => {
@@ -1010,6 +1157,10 @@ impl App {
                 match result {
                     Ok(()) => {
                         let reply_id = self.reply_draft.as_ref().map(|d| d.id.clone());
+                        let direct_reply = self
+                            .reply_draft
+                            .as_ref()
+                            .is_some_and(|d| d.original_visibility == "direct");
                         self.input.clear();
                         self.input_cursor = 0;
                         self.reply_draft = None;
@@ -1019,6 +1170,9 @@ impl App {
                             self.refresh_after_reply(&id);
                         }
                         self.refresh(Kind::Home);
+                        if direct_reply && self.tabs.iter().any(|tab| tab.kind == Kind::Direct) {
+                            self.refresh(Kind::Direct);
+                        }
                         self.status = "Posted.".into();
                     }
                     Err(e) => self.status = format!("Post failed (draft retained): {e}"),
@@ -1367,14 +1521,8 @@ impl App {
                     t.selected = t.items.len().saturating_sub(1);
                     self.update_preview();
                 }
-                KeyCode::Char('h') | KeyCode::Left => {
-                    self.active = self.active.saturating_sub(1);
-                    self.update_preview();
-                }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    self.active = (self.active + 1).min(self.tabs.len() - 1);
-                    self.update_preview();
-                }
+                KeyCode::Char('h') | KeyCode::Left => self.move_focus(false),
+                KeyCode::Char('l') | KeyCode::Right => self.move_focus(true),
                 _ => {}
             },
             Mode::Help => {
@@ -1387,24 +1535,8 @@ impl App {
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    if let Some(i) = self.tabs.iter().position(|t| t.kind == kind) {
-                        self.active = i;
-                    } else {
-                        self.tabs.push(Tab::new(kind));
-                        let stream_kind = if kind == Kind::Local {
-                            StreamKind::Local
-                        } else {
-                            StreamKind::Federated
-                        };
-                        stream::start(
-                            self.config.clone(),
-                            stream_kind,
-                            self.stream_tx.clone(),
-                            self.stop_streams.clone(),
-                        );
-                        self.active = self.tabs.len() - 1;
-                        self.refresh(kind);
-                    }
+                    self.active = self.ensure_tab(kind);
+                    self.remember_left_timeline();
                     self.mode = Mode::Normal;
                     self.update_preview();
                 } else if key.code == KeyCode::Esc {
@@ -1414,12 +1546,12 @@ impl App {
             Mode::Settings => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
                 KeyCode::Char('j') | KeyCode::Down => {
-                    self.settings_index = (self.settings_index + 1).min(3)
+                    self.settings_index = (self.settings_index + 1).min(4)
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     self.settings_index = self.settings_index.saturating_sub(1)
                 }
-                KeyCode::Char('0') if self.settings_index == 2 => self.font_candidate = None,
+                KeyCode::Char('0') if self.settings_index == 3 => self.font_candidate = None,
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('l') | KeyCode::Right => {
                     let forward = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
                     match self.settings_index {
@@ -1438,6 +1570,13 @@ impl App {
                             };
                         }
                         2 => {
+                            self.settings.layout = if forward {
+                                self.settings.layout.next()
+                            } else {
+                                self.settings.layout.previous()
+                            };
+                        }
+                        3 => {
                             self.font_candidate = Some(match (self.font_candidate, forward) {
                                 (None, true) => 10,
                                 (None, false) => 9,
@@ -1447,7 +1586,7 @@ impl App {
                         }
                         _ => {}
                     }
-                    if self.settings_index < 2 {
+                    if self.settings_index < 3 {
                         self.settings_message = match self.settings.save() {
                             Ok(()) => "Settings saved.".into(),
                             Err(e) => format!("Could not save settings: {e:#}"),
@@ -1455,12 +1594,12 @@ impl App {
                         self.status = self.settings_message.clone();
                     }
                 }
-                KeyCode::Enter if self.settings_index == 3 => {
+                KeyCode::Enter if self.settings_index == 4 => {
                     self.settings_account_index = self.active_account;
                     self.settings_message.clear();
                     self.mode = Mode::AccountManage;
                 }
-                KeyCode::Enter if self.settings_index == 2 => {
+                KeyCode::Enter if self.settings_index == 3 => {
                     self.settings_message =
                         match settings::apply_kitty_font_size(self.font_candidate) {
                             Ok(()) => {
@@ -1481,7 +1620,7 @@ impl App {
             Mode::AccountManage => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.mode = Mode::Settings;
-                    self.settings_index = 3;
+                    self.settings_index = 4;
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.settings_account_index = (self.settings_account_index + 1)
@@ -1890,12 +2029,8 @@ impl Session {
         app.picker = picker;
         app.refresh(Kind::Home);
         app.refresh(Kind::Notifications);
-        stream::start(
-            app.config.clone(),
-            StreamKind::User,
-            app.stream_tx.clone(),
-            app.stop_streams.clone(),
-        );
+        app.start_stream(StreamKind::User);
+        app.sync_layout();
         if account.id.ends_with("#legacy") {
             let tx = app.tx.clone();
             let config = app.config.clone();
@@ -2173,6 +2308,7 @@ impl Workspace {
                         if let Some(mut previous) = prior.and_then(|i| old[i].take()) {
                             replacement.app.tabs = std::mem::take(&mut previous.app.tabs);
                             replacement.app.active = previous.app.active;
+                            replacement.app.left_timeline = previous.app.left_timeline;
                             replacement.app.input = std::mem::take(&mut previous.app.input);
                             replacement.app.input_cursor = previous.app.input_cursor;
                             replacement.app.attachments =
@@ -2185,12 +2321,7 @@ impl Workspace {
                                     } else {
                                         StreamKind::Federated
                                     };
-                                    stream::start(
-                                        replacement.app.config.clone(),
-                                        stream_kind,
-                                        replacement.app.stream_tx.clone(),
-                                        replacement.app.stop_streams.clone(),
-                                    );
+                                    replacement.app.start_stream(stream_kind);
                                     replacement.app.refresh(kind);
                                 }
                             }
@@ -2204,6 +2335,7 @@ impl Workspace {
                             replacement.app.reply_draft = reply_draft;
                         }
                         replacement.app.settings = preferences.clone();
+                        replacement.app.sync_layout();
                         self.sessions.push(replacement);
                     } else if let Some(session) = exact.and_then(|i| old[i].take()) {
                         self.sessions.push(session);
@@ -2395,6 +2527,7 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, store: accounts::AccountStor
                     let preferences = workspace.sessions[active].app.settings.clone();
                     for session in &mut workspace.sessions {
                         session.app.settings = preferences.clone();
+                        session.app.sync_layout();
                     }
                 }
                 Event::Paste(text) => {
@@ -2425,6 +2558,19 @@ pub fn run(terminal: &mut ratatui::DefaultTerminal, store: accounts::AccountStor
         anyhow::bail!("{warning}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn test_add_tab(app: &mut App, title: &str) {
+    let kind = match title {
+        "Direct messages" => Kind::Direct,
+        "Federated" => Kind::Federated,
+        "Local" => Kind::Local,
+        _ => panic!("unknown test tab"),
+    };
+    if !app.tabs.iter().any(|tab| tab.kind == kind) {
+        app.tabs.push(Tab::new(kind));
+    }
 }
 
 #[cfg(test)]
@@ -2464,6 +2610,122 @@ pub(crate) fn test_app() -> App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn left_timeline_survives_side_focus_and_layout_changes_per_account() {
+        let mut app = test_app();
+        let other_account = test_app();
+        test_add_tab(&mut app, "Local");
+        test_add_tab(&mut app, "Federated");
+        test_add_tab(&mut app, "Direct messages");
+        let local = app.tabs.iter().position(|t| t.kind == Kind::Local).unwrap();
+        let federated = app
+            .tabs
+            .iter()
+            .position(|t| t.kind == Kind::Federated)
+            .unwrap();
+        let notifications = app
+            .tabs
+            .iter()
+            .position(|t| t.kind == Kind::Notifications)
+            .unwrap();
+        let direct = app
+            .tabs
+            .iter()
+            .position(|t| t.kind == Kind::Direct)
+            .unwrap();
+
+        app.active = local;
+        app.move_focus(true);
+        app.move_focus(true);
+        assert_eq!(app.active, notifications);
+        // The last visited left timeline was Federated.
+        assert_eq!(app.left_timeline_index(), Some(federated));
+        app.move_focus(false);
+        app.move_focus(false);
+        assert_eq!(app.active, local);
+        // Skip over Federated to the side panes, then return to Local and change layouts.
+        app.move_focus(true);
+        app.move_focus(true);
+        app.move_focus(true);
+        assert_eq!(app.active, direct);
+        app.settings.layout = settings::Layout::Federation;
+        app.started_streams.insert(StreamKind::Federated);
+        app.sync_layout();
+        // Federated now belongs on the right, so it cannot also be rendered on the left.
+        assert_eq!(app.left_timeline_index(), Some(0));
+        assert_eq!(app.active, 0);
+        app.active = local;
+        app.move_focus(true);
+        assert_eq!(app.active, federated);
+        assert_eq!(app.left_timeline_index(), Some(local));
+        app.move_focus(true);
+        assert_eq!(app.active, notifications);
+        assert_eq!(app.left_timeline_index(), Some(local));
+        assert_eq!(other_account.left_timeline_index(), Some(0));
+    }
+    #[test]
+    fn conversation_updates_replace_one_thread_and_preserve_selected_thread() {
+        let make = |conversation_id: &str, status_id: &str| Conversation {
+            id: conversation_id.into(),
+            unread: true,
+            last_status: Some(Status {
+                id: status_id.into(),
+                visibility: "direct".into(),
+                ..Default::default()
+            }),
+        };
+        let mut tab = Tab::new(Kind::Direct);
+        apply_event(&mut tab, &StreamEvent::Conversation(make("a", "1")));
+        apply_event(&mut tab, &StreamEvent::Conversation(make("b", "2")));
+        tab.selected = 1;
+        apply_event(&mut tab, &StreamEvent::Conversation(make("b", "3")));
+        assert_eq!(tab.items.len(), 2);
+        assert_eq!(tab.items[0].id, "3");
+        assert_eq!(tab.items[tab.selected].id, "1");
+        assert!(tab.items[0].context.contains("unread"));
+        apply_event(
+            &mut tab,
+            &StreamEvent::Conversation(Conversation {
+                id: "a".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(tab.items.len(), 1);
+        assert_eq!(tab.items[tab.selected].id, "3");
+        assert!(event_applies(
+            Kind::Direct,
+            StreamKind::Direct,
+            &StreamEvent::Conversation(make("a", "1"))
+        ));
+        assert!(!event_applies(
+            Kind::Direct,
+            StreamKind::User,
+            &StreamEvent::Conversation(make("a", "1"))
+        ));
+    }
+
+    #[test]
+    fn focus_visits_visible_panels_and_skips_hidden_ones() {
+        let mut app = test_app();
+        test_add_tab(&mut app, "Direct messages");
+        test_add_tab(&mut app, "Federated");
+        app.settings.layout = settings::Layout::Default;
+        app.move_focus(true);
+        assert_eq!(app.tabs[app.active].kind, Kind::Federated);
+        app.move_focus(true);
+        assert_eq!(app.tabs[app.active].kind, Kind::Notifications);
+        app.move_focus(true);
+        assert_eq!(app.tabs[app.active].kind, Kind::Direct);
+        app.settings.layout = settings::Layout::YourTimelineFocus;
+        app.sync_layout();
+        assert_eq!(app.tabs[app.active].kind, Kind::Federated);
+        app.settings.layout = settings::Layout::Federation;
+        app.active = 0;
+        app.move_focus(true);
+        assert_eq!(app.tabs[app.active].kind, Kind::Federated);
+        app.move_focus(true);
+        assert_eq!(app.tabs[app.active].kind, Kind::Notifications);
+    }
     #[test]
     fn reply_visibility_never_exceeds_original_or_account_preference() {
         let values = ["direct", "private", "unlisted", "public"];

@@ -66,11 +66,46 @@ impl Density {
     }
 }
 
+/// The visible panels and their arrangement in the main workspace.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layout {
+    #[default]
+    Default,
+    YourTimelineFocus,
+    Federation,
+}
+
+impl Layout {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Default => Self::YourTimelineFocus,
+            Self::YourTimelineFocus => Self::Federation,
+            Self::Federation => Self::Default,
+        }
+    }
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Default => Self::Federation,
+            Self::YourTimelineFocus => Self::Default,
+            Self::Federation => Self::YourTimelineFocus,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::YourTimelineFocus => "Your timeline focus",
+            Self::Federation => "Federation",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: Theme,
     pub density: Density,
+    pub layout: Layout,
     /// None leaves the terminal's font size untouched; Some is a Kitty size in points.
     pub font_size: Option<u8>,
 }
@@ -186,6 +221,7 @@ mod tests {
         let settings = Settings {
             theme: Theme::Light,
             density: Density::Comfortable,
+            layout: Layout::Federation,
             font_size: Some(11),
         };
         settings.save_to(&path).unwrap();
@@ -197,9 +233,31 @@ mod tests {
         assert!(Settings {
             theme: Theme::Dark,
             density: Density::Compact,
+            layout: Layout::Default,
             font_size: Some(4)
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn old_settings_default_to_the_new_workspace_layout() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"theme":"light","density":"comfortable","font_size":11}"#)
+                .unwrap();
+        assert_eq!(settings.layout, Layout::Default);
+        assert_eq!(settings.theme, Theme::Light);
+        assert_eq!(settings.density, Density::Comfortable);
+        assert_eq!(settings.font_size, Some(11));
+    }
+
+    #[test]
+    fn layout_selection_wraps_in_both_directions() {
+        assert_eq!(Layout::Default.next(), Layout::YourTimelineFocus);
+        assert_eq!(Layout::YourTimelineFocus.next(), Layout::Federation);
+        assert_eq!(Layout::Federation.next(), Layout::Default);
+        assert_eq!(Layout::Default.previous(), Layout::Federation);
+        assert_eq!(Layout::Federation.previous(), Layout::YourTimelineFocus);
+        assert_eq!(Layout::YourTimelineFocus.previous(), Layout::Default);
     }
 }
